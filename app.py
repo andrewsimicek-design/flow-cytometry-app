@@ -55,21 +55,43 @@ def _rough_sigma(smoothed, bin_centers, idx, left_bound_idx, right_bound_idx):
     return max((bin_centers[ri] - bin_centers[li]) / 2.355, bin_width)
 
 
-def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
-                      min_prominence_frac=0.03, min_distance_frac=0.015, max_peaks=3):
-    """
-    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values.
+def _fit_n_gaussians(x_fit, y_fit, components, values_min, values_max, bin_width):
+    """Fit a sum of Gaussians given initial guesses `components` (list of dicts with amp/mu/sigma)."""
+    p0, lower, upper = [], [], []
+    sigma_floor = max(bin_width * 1.5, 1e-6)
+    for c in components:
+        p0.extend([c["amp"], c["mu"], max(c["sigma"], sigma_floor * 2)])
+        lower.extend([0, values_min, sigma_floor])
+        upper.extend([np.inf, values_max, values_max])
+    popt, _ = curve_fit(_multi_gaussian, x_fit, y_fit, p0=p0, bounds=(lower, upper), maxfev=30000)
+    fitted = []
+    for i in range(0, len(popt), 3):
+        amp, mu, sigma = popt[i:i + 3]
+        cv = abs(sigma / mu) * 100 if mu != 0 else None
+        fitted.append({"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv})
+    return fitted, _multi_gaussian(x_fit, *popt)
 
-    Workflow (mirrors manual gating in flow cytometry software):
+
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
+                      min_prominence_frac=0.03, min_distance_frac=0.015, max_peaks=3,
+                      residual_prominence_frac=0.06):
+    """
+    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values,
+    using an iterative residual (peak-stripping) approach:
+
       1. Exclude events below `min_channel` (debris cutoff).
-      2. Build a fine histogram and find candidate peak locations, including small
-         and closely-spaced peaks (low prominence/distance thresholds by default).
-      3. Fit a sum of N Gaussians to the histogram using non-linear least squares,
-         where N = number of candidate peaks found (capped at max_peaks).
-      4. If the N-peak fit fails to converge, automatically retries with N-1, N-2, ...
-         peaks until a fit succeeds, so one bad candidate doesn't kill the whole fit.
-      5. CV% is computed from the FITTED sigma/mu (not raw empirical spread) -- the
-         standard convention in cytometry analysis software, robust to overlapping peaks.
+      2. Fit the single tallest peak first.
+      3. Subtract that fit from the histogram, leaving a residual.
+      4. Search the RESIDUAL for the next-largest unexplained bump. This catches small
+         or off-position peaks that are hidden in another peak's shoulder/tail and
+         would never show up as their own local maximum in the raw histogram.
+      5. If a significant residual bump is found and max_peaks hasn't been reached, add
+         it as a new component and refit ALL components together against the ORIGINAL
+         histogram (not the residual) so previously-fit peaks are refined too.
+      6. Repeat until no significant residual remains or max_peaks is reached.
+
+    CV% is computed from the FITTED sigma/mu -- the standard convention in cytometry
+    analysis software, robust to overlapping/off-position peaks.
 
     Returns a dict:
       {
@@ -92,90 +114,85 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
     hist, bin_edges = np.histogram(values, bins=bins)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     result["hist"] = (bin_centers, hist)
+    bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
 
     kernel = np.ones(smooth_window) / smooth_window
     smoothed = np.convolve(hist, kernel, mode="same")
+    x_fit = bin_centers
+    y_fit = hist.astype(float)
+    n_bins = len(smoothed)
 
-    prominence = max(smoothed.max() * min_prominence_frac, 1e-9)
-    distance = max(int(bins * min_distance_frac), 1)
-    peak_idx, _ = find_peaks(smoothed, prominence=prominence, distance=distance)
+    global_max = smoothed.max()
+    if global_max <= 0:
+        result["note"] = "No signal in histogram."
+        return result
 
+    # --- seed with the single tallest peak ---
+    seed_prom = max(global_max * min_prominence_frac, 1e-9)
+    seed_dist = max(int(bins * min_distance_frac), 1)
+    peak_idx, _ = find_peaks(smoothed, prominence=seed_prom, distance=seed_dist)
     if len(peak_idx) == 0:
         result["note"] = "No peaks detected."
         return result
 
-    heights = smoothed[peak_idx]
+    tallest = peak_idx[np.argmax(smoothed[peak_idx])]
+    components = [{
+        "amp": smoothed[tallest], "mu": bin_centers[tallest],
+        "sigma": _rough_sigma(smoothed, bin_centers, tallest, 0, n_bins - 1),
+    }]
 
-    # Merge candidates that are really flanks/noise on the same underlying peak:
-    # walk candidates from tallest to shortest, only keep one if it isn't too close
-    # (relative to typical peak width) to an already-kept, taller candidate.
-    order = np.argsort(heights)[::-1]  # tallest first
-    kept = []
-    min_sep_bins = max(int(bins * 0.04), 3)  # minimum bin separation between distinct peaks
-    for oi in order:
-        idx = peak_idx[oi]
-        if all(abs(idx - k) >= min_sep_bins for k in kept):
-            kept.append(idx)
-        if len(kept) >= max_peaks:
+    try:
+        fitted, curve = _fit_n_gaussians(x_fit, y_fit, components, values.min(), values.max(), bin_width)
+    except Exception as fit_err:
+        result["note"] = f"Initial peak fit failed: {fit_err}"
+        return result
+
+    min_sep_bins = max(int(bins * 0.03), 3)
+
+    # --- iteratively search the residual for additional (possibly hidden/off-position) peaks ---
+    while len(fitted) < max_peaks:
+        residual = y_fit - curve
+        residual_smoothed = np.convolve(residual, kernel, mode="same")
+
+        res_prom = max(global_max * residual_prominence_frac, 1e-9)
+        res_idx, _ = find_peaks(residual_smoothed, prominence=res_prom, distance=seed_dist)
+
+        # ignore residual candidates too close to an already-fitted peak
+        existing_bin_positions = [np.argmin(np.abs(bin_centers - c["mu"])) for c in fitted]
+        res_idx = [ri for ri in res_idx if all(abs(ri - e) >= min_sep_bins for e in existing_bin_positions)]
+
+        if not res_idx:
             break
-    keep_idx = np.sort(np.array(kept))
 
-    x_fit = bin_centers
-    y_fit = hist.astype(float)
-    n_bins = len(smoothed)
-    last_err = "no candidates"
+        best_ri = max(res_idx, key=lambda ri: residual_smoothed[ri])
+        new_component = {
+            "amp": max(residual_smoothed[best_ri], bin_width),
+            "mu": bin_centers[best_ri],
+            "sigma": _rough_sigma(residual_smoothed, bin_centers, best_ri, 0, n_bins - 1),
+        }
 
-    # try fitting with all candidate peaks, then fall back to fewer if the fit fails
-    for n_try in range(len(keep_idx), 0, -1):
-        subset = keep_idx[np.argsort(smoothed[keep_idx])[-n_try:]]
-        subset = np.sort(subset)
-
-        p0 = []
-        lower = []
-        upper = []
-        for j, idx in enumerate(subset):
-            left_bound = subset[j - 1] if j > 0 else 0
-            right_bound = subset[j + 1] if j < len(subset) - 1 else n_bins - 1
-            amp0 = smoothed[idx]
-            mu0 = bin_centers[idx]
-            sigma0 = _rough_sigma(smoothed, bin_centers, idx, left_bound, right_bound)
-            bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
-            sigma_floor = max(bin_width * 1.5, 1e-6)
-            p0.extend([amp0, mu0, max(sigma0, sigma_floor * 2)])
-            lower.extend([0, values.min(), sigma_floor])
-            upper.extend([np.inf, values.max(), values.max()])
-
+        trial_components = [{"amp": c["amp"], "mu": c["mu"], "sigma": c["sigma"]} for c in fitted] + [new_component]
         try:
-            popt, _ = curve_fit(
-                _multi_gaussian, x_fit, y_fit, p0=p0,
-                bounds=(lower, upper), maxfev=30000,
+            trial_fitted, trial_curve = _fit_n_gaussians(
+                x_fit, y_fit, trial_components, values.min(), values.max(), bin_width
             )
-            peaks = []
-            for i in range(0, len(popt), 3):
-                amp, mu, sigma = popt[i:i + 3]
-                cv = abs(sigma / mu) * 100 if mu != 0 else None
-                peaks.append({"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv})
+        except Exception:
+            break  # adding this peak didn't help -- stop here with what we have
 
-            # drop degenerate/negligible-amplitude fit components (fitting artifacts,
-            # not real populations) as long as at least one peak remains
-            if len(peaks) > 1:
-                max_amp = max(p["amp"] for p in peaks)
-                filtered = [p for p in peaks if p["amp"] >= 0.05 * max_amp]
-                if filtered:
-                    peaks = filtered
+        # accept the extra peak only if it isn't a negligible/degenerate artifact
+        max_amp = max(p["amp"] for p in trial_fitted)
+        if new := next((p for p in trial_fitted if abs(p["mu"] - new_component["mu"]) < bin_width * 5), None):
+            if new["amp"] < 0.04 * max_amp:
+                break
 
-            peaks.sort(key=lambda p: p["mu"])
-            result["peaks"] = peaks
-            result["fit_curve"] = (x_fit, _multi_gaussian(x_fit, *popt))
-            result["success"] = True
-            if n_try < len(keep_idx):
-                result["note"] = f"Fit converged with {n_try} peak(s) after {len(keep_idx)}-peak fit failed."
-            return result
-        except Exception as fit_err:
-            last_err = fit_err
-            continue
+        fitted, curve = trial_fitted, trial_curve
 
-    result["note"] = f"Gaussian fit failed at every peak count: {last_err}"
+    fitted.sort(key=lambda p: p["mu"])
+    result["peaks"] = fitted
+    result["fit_curve"] = (x_fit, curve)
+    result["success"] = True
+    if len(fitted) > 1:
+        result["note"] = f"Found {len(fitted)} peak(s) via iterative residual search."
     return result
 
 
