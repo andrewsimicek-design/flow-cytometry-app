@@ -41,64 +41,136 @@ def _multi_gaussian(x, *params):
     return y
 
 
+def _make_model_with_background(x_min):
+    """
+    Build a model function: exponential-decay BACKGROUND + sum of N Gaussian PEAKS.
+
+    The background term absorbs broad, slowly-decaying debris/noise baseline (very
+    common in flow cytometry histograms: lots of small events at low channels, tailing
+    off toward higher channels). Without it, that baseline "hump" competes with genuine
+    small peaks for a limited peak budget and can get modeled as a fake broad peak
+    instead -- which was hiding real, smaller peaks (e.g. a real 3rd peak) from being found.
+    """
+    def _model(x, bg_amp, bg_k, *gauss_params):
+        bg = bg_amp * np.exp(-bg_k * (x - x_min))
+        return bg + _multi_gaussian(x, *gauss_params)
+    return _model
+
+
 def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_hist, n_restarts, rng):
     """
-    Try to fit exactly `n_peaks` Gaussians to the histogram using `n_restarts` random
-    initial guesses (random peak positions/widths/heights each time), keeping whichever
-    restart converges to the lowest sum-of-squared-error fit. This is what lets small or
-    off-position peaks get found even when a single "smart guess" attempt would miss them --
-    across many random starting points, at least one is likely to land near the true peak.
+    Try to fit exactly `n_peaks` Gaussian PEAKS plus one background term to the histogram,
+    using `n_restarts` random initial guesses (random peak positions/widths/heights/background
+    shape each time), keeping whichever restart converges to the lowest sum-of-squared-error
+    fit. This is what lets small or off-position peaks get found even when a single "smart
+    guess" attempt would miss them -- across many random starting points, at least one is
+    likely to land near each true peak, and the background term keeps debris/baseline noise
+    from stealing a peak slot.
     """
     span = max(values_max - values_min, 1e-6)
     sigma_floor = max(bin_width * 1.2, 1e-6)
-    best = None  # (sse, peaks, curve)
+    model_func = _make_model_with_background(values_min)
+    best = None  # (sse, peaks, curve, bg_amp, bg_k)
 
     for _ in range(n_restarts):
+        bg_amp0 = rng.uniform(0, max_hist * 0.6)
+        bg_k0 = rng.uniform(0, 15.0 / span)
+
         mus0 = np.sort(rng.uniform(values_min, values_max, n_peaks))
         sigmas0 = rng.uniform(max(sigma_floor, span * 0.003), span * 0.3, n_peaks)
         amps0 = rng.uniform(0.05 * max_hist, max(max_hist * 1.2, 1.0), n_peaks)
 
-        p0, lower, upper = [], [], []
+        p0 = [bg_amp0, bg_k0]
+        lower = [0, 0]
+        upper = [max_hist, 200.0 / span]
         for i in range(n_peaks):
             p0.extend([amps0[i], mus0[i], sigmas0[i]])
             lower.extend([0, values_min, sigma_floor])
             upper.extend([np.inf, values_max, span])
 
         try:
-            popt, _ = curve_fit(_multi_gaussian, x_fit, y_fit, p0=p0, bounds=(lower, upper), maxfev=4000)
+            popt, _ = curve_fit(model_func, x_fit, y_fit, p0=p0, bounds=(lower, upper), maxfev=4000)
         except Exception:
             continue
 
-        model = _multi_gaussian(x_fit, *popt)
+        model = model_func(x_fit, *popt)
         sse = float(np.sum((model - y_fit) ** 2))
 
         if best is None or sse < best[0]:
+            bg_amp, bg_k = popt[0], popt[1]
+            gauss_params = popt[2:]
             peaks = []
-            for i in range(0, len(popt), 3):
-                amp, mu, sigma = popt[i:i + 3]
+            for i in range(0, len(gauss_params), 3):
+                amp, mu, sigma = gauss_params[i:i + 3]
                 cv = abs(sigma / mu) * 100 if mu != 0 else None
                 peaks.append({"mu": float(mu), "sigma": float(sigma), "amp": float(amp), "cv_percent": cv})
             peaks.sort(key=lambda p: p["mu"])
-            best = (sse, peaks, model)
+            best = (sse, peaks, model, float(bg_amp), float(bg_k))
 
     return best
+
+
+def _merge_close_peaks(peaks, min_separation_sigma=1.0):
+    """
+    Merge fitted peaks that are really the same underlying population split into two
+    near-duplicate Gaussians (can happen when the optimizer finds a slightly-lower-SSE
+    solution by "cheating" with two overlapping components instead of one honest peak).
+    Two peaks are merged if their centers are closer than `min_separation_sigma` times
+    their average sigma. Merging uses proper Gaussian-mixture moment matching so the
+    combined peak's mu/sigma/amp represent the pooled population, not just one of the two.
+    """
+    if len(peaks) < 2:
+        return peaks
+
+    peaks = sorted(peaks, key=lambda p: p["mu"])
+    merged = [peaks[0]]
+
+    for p in peaks[1:]:
+        last = merged[-1]
+        avg_sigma = (last["sigma"] + p["sigma"]) / 2.0
+        if avg_sigma > 0 and abs(p["mu"] - last["mu"]) < min_separation_sigma * avg_sigma:
+            w1 = last["amp"] * last["sigma"]
+            w2 = p["amp"] * p["sigma"]
+            total_w = w1 + w2
+            if total_w <= 0:
+                continue
+            combined_mu = (w1 * last["mu"] + w2 * p["mu"]) / total_w
+            combined_var = (
+                w1 * (last["sigma"] ** 2 + (last["mu"] - combined_mu) ** 2)
+                + w2 * (p["sigma"] ** 2 + (p["mu"] - combined_mu) ** 2)
+            ) / total_w
+            combined_sigma = float(np.sqrt(max(combined_var, 1e-12)))
+            combined_area = w1 * np.sqrt(2 * np.pi) + w2 * np.sqrt(2 * np.pi)
+            combined_amp = combined_area / (combined_sigma * np.sqrt(2 * np.pi))
+            cv = abs(combined_sigma / combined_mu) * 100 if combined_mu != 0 else None
+            merged[-1] = {
+                "mu": combined_mu, "sigma": combined_sigma,
+                "amp": combined_amp, "cv_percent": cv,
+            }
+        else:
+            merged.append(p)
+
+    return merged
 
 
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42):
     """
     Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values
-    using a multi-start global search:
+    using a multi-start global search, with a separate background term for debris/baseline:
 
       1. Exclude events below `min_channel` (debris cutoff).
-      2. For EVERY candidate peak count n = 1, 2, ..., max_peaks: try `n_restarts` random
-         initial guesses (random positions/widths/heights) and keep the best-converging fit
-         for that n. This brute-force restart strategy is what catches small or off-position
-         peaks a single "smart initial guess" attempt would miss.
-      3. Compare the best fit for each n using BIC (Bayesian Information Criterion), which
+      2. The fit model is: exponential-decay BACKGROUND + N Gaussian PEAKS. The background
+         absorbs broad, low, slowly-decaying debris noise so it can't masquerade as (or hide)
+         a real peak.
+      3. For EVERY candidate peak count n = 1, 2, ..., max_peaks: try `n_restarts` random
+         initial guesses (random positions/widths/heights/background shape) and keep the
+         best-converging fit for that n. This brute-force restart strategy is what catches
+         small or off-position peaks a single "smart initial guess" attempt would miss.
+      4. Compare the best fit for each n using BIC (Bayesian Information Criterion), which
          rewards a lower fitting error but penalizes extra peaks -- this automatically avoids
          hallucinating extra peaks out of noise while still using more peaks when they
          genuinely explain the data better.
-      4. Report the peak count / fit that wins that comparison.
+      5. Report the peak count / fit that wins that comparison.
 
     CV% is computed from the FITTED sigma/mu -- the standard convention in cytometry
     analysis software, robust to overlapping/off-position peaks.
@@ -154,18 +226,22 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
 
     def bic(sse, n_peaks):
         sse = max(sse, 1e-9)
-        k = 3 * n_peaks  # 3 params (amp, mu, sigma) per peak
+        k = 3 * n_peaks + 2  # 3 params/peak + 2 background params, present in every model
         return n_data * np.log(sse / n_data) + k * np.log(n_data)
 
     best_n = min(results_by_n.keys(), key=lambda n: bic(results_by_n[n][0], n))
-    sse, peaks, curve = results_by_n[best_n]
+    sse, peaks, curve, bg_amp, bg_k = results_by_n[best_n]
+    peaks = _merge_close_peaks(peaks)
 
     result["peaks"] = peaks
     result["fit_curve"] = (x_fit, curve)
     result["success"] = True
+    merge_note = " (2 near-duplicate peaks merged into 1)" if len(peaks) < best_n else ""
     result["note"] = (
-        f"Selected {best_n}-peak fit (multi-start search, {n_restarts} restarts per peak count, "
-        f"best of {list(results_by_n.keys())} peak-count options via BIC)."
+        f"Selected {best_n}-peak fit, {len(peaks)} peak(s) after cleanup{merge_note} "
+        f"(multi-start search, {n_restarts} restarts per peak count, "
+        f"best of {list(results_by_n.keys())} peak-count options via BIC; background amp={bg_amp:.1f}, "
+        f"decay k={bg_k:.5f})."
         if len(results_by_n) > 1 or best_n > 1 else ""
     )
     return result
