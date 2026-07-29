@@ -18,6 +18,8 @@ TRACKING_FIELDS = [
     "2_peak_CV",
     "3_peak",
     "3_peak_CV",
+    "4_peak",
+    "4_peak_CV",
     "raKo_sample/standard",
     "raKo_endosperm/embryo",
     "date_FCM",
@@ -31,23 +33,43 @@ def _gaussian(x, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
 
-def _two_gaussians(x, amp1, mu1, sigma1, amp2, mu2, sigma2):
-    return _gaussian(x, amp1, mu1, sigma1) + _gaussian(x, amp2, mu2, sigma2)
+def _multi_gaussian(x, *params):
+    """Sum of N Gaussians. params is a flat sequence of (amp, mu, sigma) triplets."""
+    y = np.zeros_like(x, dtype=float)
+    for i in range(0, len(params), 3):
+        amp, mu, sigma = params[i:i + 3]
+        y += _gaussian(x, amp, mu, sigma)
+    return y
 
 
-def fit_ploidy_peaks(values, min_channel=0.0, bins=256, smooth_window=5,
-                      min_prominence_frac=0.05, min_distance_frac=0.03):
+def _rough_sigma(smoothed, bin_centers, idx, left_bound_idx, right_bound_idx):
+    """Half-max width around a candidate peak, clipped so it can't cross into a neighboring peak."""
+    amp0 = smoothed[idx]
+    half = amp0 / 2.0
+    li, ri = idx, idx
+    while li > left_bound_idx and smoothed[li] > half:
+        li -= 1
+    while ri < right_bound_idx and smoothed[ri] > half:
+        ri += 1
+    bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
+    return max((bin_centers[ri] - bin_centers[li]) / 2.355, bin_width)
+
+
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
+                      min_prominence_frac=0.03, min_distance_frac=0.015, max_peaks=3):
     """
-    Detect and Gaussian-fit up to two ploidy peaks in a 1D array of channel values.
+    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values.
 
     Workflow (mirrors manual gating in flow cytometry software):
       1. Exclude events below `min_channel` (debris cutoff).
-      2. Build a histogram and find candidate peak locations.
-      3. Fit a single Gaussian (one peak) or a sum of two Gaussians (two peaks)
-         to the histogram using non-linear least squares.
-      4. CV% is computed from the FITTED sigma/mu, not the raw empirical spread --
-         this is the standard convention used in cytometry analysis software and
-         is robust even when two peaks partially overlap.
+      2. Build a fine histogram and find candidate peak locations, including small
+         and closely-spaced peaks (low prominence/distance thresholds by default).
+      3. Fit a sum of N Gaussians to the histogram using non-linear least squares,
+         where N = number of candidate peaks found (capped at max_peaks).
+      4. If the N-peak fit fails to converge, automatically retries with N-1, N-2, ...
+         peaks until a fit succeeds, so one bad candidate doesn't kill the whole fit.
+      5. CV% is computed from the FITTED sigma/mu (not raw empirical spread) -- the
+         standard convention in cytometry analysis software, robust to overlapping peaks.
 
     Returns a dict:
       {
@@ -83,78 +105,77 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=256, smooth_window=5,
         return result
 
     heights = smoothed[peak_idx]
-    top_idx = peak_idx[np.argsort(heights)[-2:]]
-    top_idx = np.sort(top_idx)
+
+    # Merge candidates that are really flanks/noise on the same underlying peak:
+    # walk candidates from tallest to shortest, only keep one if it isn't too close
+    # (relative to typical peak width) to an already-kept, taller candidate.
+    order = np.argsort(heights)[::-1]  # tallest first
+    kept = []
+    min_sep_bins = max(int(bins * 0.04), 3)  # minimum bin separation between distinct peaks
+    for oi in order:
+        idx = peak_idx[oi]
+        if all(abs(idx - k) >= min_sep_bins for k in kept):
+            kept.append(idx)
+        if len(kept) >= max_peaks:
+            break
+    keep_idx = np.sort(np.array(kept))
 
     x_fit = bin_centers
     y_fit = hist.astype(float)
+    n_bins = len(smoothed)
+    last_err = "no candidates"
 
-    try:
-        if len(top_idx) == 1:
-            i0 = top_idx[0]
-            amp0 = smoothed[i0]
-            mu0 = bin_centers[i0]
-            # rough sigma guess from half-max width
-            half = amp0 / 2.0
-            li, ri = i0, i0
-            while li > 0 and smoothed[li] > half:
-                li -= 1
-            while ri < len(smoothed) - 1 and smoothed[ri] > half:
-                ri += 1
-            sigma0 = max((bin_centers[ri] - bin_centers[li]) / 2.355, (bin_centers[1] - bin_centers[0]))
+    # try fitting with all candidate peaks, then fall back to fewer if the fit fails
+    for n_try in range(len(keep_idx), 0, -1):
+        subset = keep_idx[np.argsort(smoothed[keep_idx])[-n_try:]]
+        subset = np.sort(subset)
 
+        p0 = []
+        lower = []
+        upper = []
+        for j, idx in enumerate(subset):
+            left_bound = subset[j - 1] if j > 0 else 0
+            right_bound = subset[j + 1] if j < len(subset) - 1 else n_bins - 1
+            amp0 = smoothed[idx]
+            mu0 = bin_centers[idx]
+            sigma0 = _rough_sigma(smoothed, bin_centers, idx, left_bound, right_bound)
+            bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
+            sigma_floor = max(bin_width * 1.5, 1e-6)
+            p0.extend([amp0, mu0, max(sigma0, sigma_floor * 2)])
+            lower.extend([0, values.min(), sigma_floor])
+            upper.extend([np.inf, values.max(), values.max()])
+
+        try:
             popt, _ = curve_fit(
-                _gaussian, x_fit, y_fit,
-                p0=[amp0, mu0, sigma0],
-                bounds=([0, values.min(), 1e-6], [np.inf, values.max(), values.max()]),
-                maxfev=10000,
+                _multi_gaussian, x_fit, y_fit, p0=p0,
+                bounds=(lower, upper), maxfev=30000,
             )
-            amp, mu, sigma = popt
-            cv = abs(sigma / mu) * 100 if mu != 0 else None
-            result["peaks"] = [{"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv}]
-            result["fit_curve"] = (x_fit, _gaussian(x_fit, *popt))
-            result["success"] = True
+            peaks = []
+            for i in range(0, len(popt), 3):
+                amp, mu, sigma = popt[i:i + 3]
+                cv = abs(sigma / mu) * 100 if mu != 0 else None
+                peaks.append({"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv})
 
-        else:
-            i1, i2 = top_idx
-            amp1_0, amp2_0 = smoothed[i1], smoothed[i2]
-            mu1_0, mu2_0 = bin_centers[i1], bin_centers[i2]
+            # drop degenerate/negligible-amplitude fit components (fitting artifacts,
+            # not real populations) as long as at least one peak remains
+            if len(peaks) > 1:
+                max_amp = max(p["amp"] for p in peaks)
+                filtered = [p for p in peaks if p["amp"] >= 0.05 * max_amp]
+                if filtered:
+                    peaks = filtered
 
-            def rough_sigma(idx, amp0):
-                half = amp0 / 2.0
-                li, ri = idx, idx
-                while li > 0 and smoothed[li] > half:
-                    li -= 1
-                while ri < len(smoothed) - 1 and smoothed[ri] > half:
-                    ri += 1
-                return max((bin_centers[ri] - bin_centers[li]) / 2.355, (bin_centers[1] - bin_centers[0]))
-
-            sigma1_0 = rough_sigma(i1, amp1_0)
-            sigma2_0 = rough_sigma(i2, amp2_0)
-
-            p0 = [amp1_0, mu1_0, sigma1_0, amp2_0, mu2_0, sigma2_0]
-            lower = [0, values.min(), 1e-6, 0, values.min(), 1e-6]
-            upper = [np.inf, values.max(), values.max(), np.inf, values.max(), values.max()]
-
-            popt, _ = curve_fit(
-                _two_gaussians, x_fit, y_fit, p0=p0,
-                bounds=(lower, upper), maxfev=20000,
-            )
-            amp1, mu1, sigma1, amp2, mu2, sigma2 = popt
-
-            peaks = [
-                {"mu": mu1, "sigma": sigma1, "amp": amp1, "cv_percent": abs(sigma1 / mu1) * 100 if mu1 != 0 else None},
-                {"mu": mu2, "sigma": sigma2, "amp": amp2, "cv_percent": abs(sigma2 / mu2) * 100 if mu2 != 0 else None},
-            ]
             peaks.sort(key=lambda p: p["mu"])
             result["peaks"] = peaks
-            result["fit_curve"] = (x_fit, _two_gaussians(x_fit, *popt))
+            result["fit_curve"] = (x_fit, _multi_gaussian(x_fit, *popt))
             result["success"] = True
+            if n_try < len(keep_idx):
+                result["note"] = f"Fit converged with {n_try} peak(s) after {len(keep_idx)}-peak fit failed."
+            return result
+        except Exception as fit_err:
+            last_err = fit_err
+            continue
 
-    except Exception as fit_err:
-        result["note"] = f"Gaussian fit failed: {fit_err}"
-        return result
-
+    result["note"] = f"Gaussian fit failed at every peak count: {last_err}"
     return result
 
 
@@ -186,7 +207,7 @@ def peek_channels_and_files(uploaded_files):
 
 # ------------------------- Core batch analysis -------------------------
 
-def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel):
+def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3):
     try:
         if not uploaded_files:
             return "No files were uploaded. Please upload one or more .fcs files.", pd.DataFrame(), None
@@ -214,7 +235,9 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
 
                 numeric_data = data.select_dtypes(include="number")
                 if dna_channel in numeric_data.columns:
-                    fit_cache[filename] = fit_ploidy_peaks(numeric_data[dna_channel].values, min_channel=min_channel)
+                    fit_cache[filename] = fit_ploidy_peaks(
+                        numeric_data[dna_channel].values, min_channel=min_channel, max_peaks=max_peaks
+                    )
             except Exception:
                 pass
 
@@ -259,10 +282,12 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                         "Explained Variance Ratio": None,
                     })
 
-                # --- Gaussian-fitted ploidy peaks ---
+                # --- Gaussian-fitted ploidy peaks (up to 3: 2C, 3C, 4C) ---
                 two_peak_cv = ""
                 three_peak = ""
                 three_peak_cv = ""
+                four_peak = ""
+                four_peak_cv = ""
                 rako_endo_embryo = ""
                 rako_sample_std = ""
                 date_fcm = meta.get("$DATE", "") if isinstance(meta, dict) else ""
@@ -272,12 +297,16 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                     peaks = fit["peaks"]
                     if len(peaks) >= 1 and peaks[0]["cv_percent"] is not None:
                         two_peak_cv = round(peaks[0]["cv_percent"], 3)
-                    if len(peaks) == 2:
+                    if len(peaks) >= 2:
                         three_peak = round(float(peaks[1]["mu"]), 3)
                         if peaks[1]["cv_percent"] is not None:
                             three_peak_cv = round(peaks[1]["cv_percent"], 3)
                         if peaks[0]["mu"] != 0:
                             rako_endo_embryo = round(float(peaks[1]["mu"] / peaks[0]["mu"]), 4)
+                    if len(peaks) >= 3:
+                        four_peak = round(float(peaks[2]["mu"]), 3)
+                        if peaks[2]["cv_percent"] is not None:
+                            four_peak_cv = round(peaks[2]["cv_percent"], 3)
 
                     if standard_2c_mean:
                         if filename == standard_filename:
@@ -295,6 +324,8 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                     "2_peak_CV": two_peak_cv,
                     "3_peak": three_peak,
                     "3_peak_CV": three_peak_cv,
+                    "4_peak": four_peak,
+                    "4_peak_CV": four_peak_cv,
                     "raKo_sample/standard": rako_sample_std,
                     "raKo_endosperm/embryo": rako_endo_embryo,
                     "date_FCM": date_fcm,
@@ -365,11 +396,12 @@ uploaded_files = st.file_uploader(
 dna_channel = None
 standard_filename = "None"
 min_channel = 0.0
+max_peaks = 3
 
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         if channels:
             dna_channel = st.selectbox(
@@ -389,6 +421,12 @@ if uploaded_files:
             min_value=0.0, value=0.0, step=100.0,
             help="Set this above any debris peak near the origin, based on the preview plot below.",
         )
+    with col4:
+        max_peaks = st.number_input(
+            "Max peaks to detect",
+            min_value=1, max_value=5, value=3, step=1,
+            help="Detects up to this many peaks (e.g. 2C, 3C, 4C), even if some are small or close together.",
+        )
 
     st.subheader("Preview: check the fit before running the full batch")
     preview_file_name = st.selectbox("File to preview", options=filenames, key="preview_select")
@@ -401,7 +439,7 @@ if uploaded_files:
             if dna_channel not in pnumeric.columns:
                 st.error(f"Channel '{dna_channel}' not found in this file.")
             else:
-                fit = fit_ploidy_peaks(pnumeric[dna_channel].values, min_channel=min_channel)
+                fit = fit_ploidy_peaks(pnumeric[dna_channel].values, min_channel=min_channel, max_peaks=max_peaks)
                 fig, ax = plt.subplots(figsize=(8, 4))
                 if fit["hist"] is not None:
                     bc, h = fit["hist"]
@@ -432,7 +470,7 @@ if st.button("Run Batch Analysis", type="primary"):
         std_name = None if standard_filename == "None" else standard_filename
         with st.spinner("Processing files..."):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
-                uploaded_files, dna_channel, std_name, min_channel
+                uploaded_files, dna_channel, std_name, min_channel, max_peaks
             )
 
         st.subheader("Processing Summary")
