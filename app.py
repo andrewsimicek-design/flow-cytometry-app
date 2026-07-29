@@ -7,8 +7,10 @@ import numpy as np
 import streamlit as st
 import pandas as pd
 import fcsparser
+import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from scipy.signal import find_peaks
+from scipy.optimize import curve_fit
 
 OUTPUT_XLSX_NAME = "batch_flow_cytometry_analysis.xlsx"
 
@@ -23,10 +25,142 @@ TRACKING_FIELDS = [
 ]
 
 
-# ------------------------- Helpers -------------------------
+# ------------------------- Gaussian fitting core -------------------------
+
+def _gaussian(x, amp, mu, sigma):
+    return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+
+def _two_gaussians(x, amp1, mu1, sigma1, amp2, mu2, sigma2):
+    return _gaussian(x, amp1, mu1, sigma1) + _gaussian(x, amp2, mu2, sigma2)
+
+
+def fit_ploidy_peaks(values, min_channel=0.0, bins=256, smooth_window=5,
+                      min_prominence_frac=0.05, min_distance_frac=0.03):
+    """
+    Detect and Gaussian-fit up to two ploidy peaks in a 1D array of channel values.
+
+    Workflow (mirrors manual gating in flow cytometry software):
+      1. Exclude events below `min_channel` (debris cutoff).
+      2. Build a histogram and find candidate peak locations.
+      3. Fit a single Gaussian (one peak) or a sum of two Gaussians (two peaks)
+         to the histogram using non-linear least squares.
+      4. CV% is computed from the FITTED sigma/mu, not the raw empirical spread --
+         this is the standard convention used in cytometry analysis software and
+         is robust even when two peaks partially overlap.
+
+    Returns a dict:
+      {
+        "success": bool,
+        "peaks": [ {"mu": ..., "sigma": ..., "amp": ..., "cv_percent": ...}, ... ] (ascending mu),
+        "hist": (bin_centers, hist_counts),
+        "fit_curve": (x_smooth, y_smooth) or None,
+        "note": str
+      }
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[values >= min_channel]
+
+    result = {"success": False, "peaks": [], "hist": None, "fit_curve": None, "note": ""}
+
+    if values.size < 20:
+        result["note"] = "Too few events after debris cutoff to fit peaks."
+        return result
+
+    hist, bin_edges = np.histogram(values, bins=bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    result["hist"] = (bin_centers, hist)
+
+    kernel = np.ones(smooth_window) / smooth_window
+    smoothed = np.convolve(hist, kernel, mode="same")
+
+    prominence = max(smoothed.max() * min_prominence_frac, 1e-9)
+    distance = max(int(bins * min_distance_frac), 1)
+    peak_idx, _ = find_peaks(smoothed, prominence=prominence, distance=distance)
+
+    if len(peak_idx) == 0:
+        result["note"] = "No peaks detected."
+        return result
+
+    heights = smoothed[peak_idx]
+    top_idx = peak_idx[np.argsort(heights)[-2:]]
+    top_idx = np.sort(top_idx)
+
+    x_fit = bin_centers
+    y_fit = hist.astype(float)
+
+    try:
+        if len(top_idx) == 1:
+            i0 = top_idx[0]
+            amp0 = smoothed[i0]
+            mu0 = bin_centers[i0]
+            # rough sigma guess from half-max width
+            half = amp0 / 2.0
+            li, ri = i0, i0
+            while li > 0 and smoothed[li] > half:
+                li -= 1
+            while ri < len(smoothed) - 1 and smoothed[ri] > half:
+                ri += 1
+            sigma0 = max((bin_centers[ri] - bin_centers[li]) / 2.355, (bin_centers[1] - bin_centers[0]))
+
+            popt, _ = curve_fit(
+                _gaussian, x_fit, y_fit,
+                p0=[amp0, mu0, sigma0],
+                bounds=([0, values.min(), 1e-6], [np.inf, values.max(), values.max()]),
+                maxfev=10000,
+            )
+            amp, mu, sigma = popt
+            cv = abs(sigma / mu) * 100 if mu != 0 else None
+            result["peaks"] = [{"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv}]
+            result["fit_curve"] = (x_fit, _gaussian(x_fit, *popt))
+            result["success"] = True
+
+        else:
+            i1, i2 = top_idx
+            amp1_0, amp2_0 = smoothed[i1], smoothed[i2]
+            mu1_0, mu2_0 = bin_centers[i1], bin_centers[i2]
+
+            def rough_sigma(idx, amp0):
+                half = amp0 / 2.0
+                li, ri = idx, idx
+                while li > 0 and smoothed[li] > half:
+                    li -= 1
+                while ri < len(smoothed) - 1 and smoothed[ri] > half:
+                    ri += 1
+                return max((bin_centers[ri] - bin_centers[li]) / 2.355, (bin_centers[1] - bin_centers[0]))
+
+            sigma1_0 = rough_sigma(i1, amp1_0)
+            sigma2_0 = rough_sigma(i2, amp2_0)
+
+            p0 = [amp1_0, mu1_0, sigma1_0, amp2_0, mu2_0, sigma2_0]
+            lower = [0, values.min(), 1e-6, 0, values.min(), 1e-6]
+            upper = [np.inf, values.max(), values.max(), np.inf, values.max(), values.max()]
+
+            popt, _ = curve_fit(
+                _two_gaussians, x_fit, y_fit, p0=p0,
+                bounds=(lower, upper), maxfev=20000,
+            )
+            amp1, mu1, sigma1, amp2, mu2, sigma2 = popt
+
+            peaks = [
+                {"mu": mu1, "sigma": sigma1, "amp": amp1, "cv_percent": abs(sigma1 / mu1) * 100 if mu1 != 0 else None},
+                {"mu": mu2, "sigma": sigma2, "amp": amp2, "cv_percent": abs(sigma2 / mu2) * 100 if mu2 != 0 else None},
+            ]
+            peaks.sort(key=lambda p: p["mu"])
+            result["peaks"] = peaks
+            result["fit_curve"] = (x_fit, _two_gaussians(x_fit, *popt))
+            result["success"] = True
+
+    except Exception as fit_err:
+        result["note"] = f"Gaussian fit failed: {fit_err}"
+        return result
+
+    return result
+
+
+# ------------------------- FCS parsing helpers -------------------------
 
 def _parse_fcs(uploaded_file):
-    """Write an in-memory uploaded file to disk temporarily and parse it with fcsparser."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".fcs") as tmp:
         tmp.write(uploaded_file.getbuffer())
         tmp_path = tmp.name
@@ -37,71 +171,7 @@ def _parse_fcs(uploaded_file):
     return meta, data
 
 
-def _detect_peaks(values, bins=200, smooth_window=5, min_prominence_frac=0.05, min_distance_frac=0.03):
-    """
-    Detect up to two dominant peaks (ploidy peaks) in a 1D array of channel values.
-    Returns a list of (peak_center_value, group_values) for each detected peak,
-    sorted by ascending channel position (lower = 2C/embryo, higher = 3C/endosperm).
-    """
-    values = np.asarray(values, dtype=float)
-    if values.size < 10:
-        return []
-
-    hist, bin_edges = np.histogram(values, bins=bins)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    # simple moving-average smoothing
-    if smooth_window > 1:
-        kernel = np.ones(smooth_window) / smooth_window
-        smoothed = np.convolve(hist, kernel, mode="same")
-    else:
-        smoothed = hist.astype(float)
-
-    prominence = max(smoothed.max() * min_prominence_frac, 1e-9)
-    distance = max(int(bins * min_distance_frac), 1)
-
-    peak_idx, props = find_peaks(smoothed, prominence=prominence, distance=distance)
-    if len(peak_idx) == 0:
-        return []
-
-    # Keep the two tallest peaks, then order them by position (ascending)
-    heights = smoothed[peak_idx]
-    top_two_idx = peak_idx[np.argsort(heights)[-2:]]
-    top_two_idx = np.sort(top_two_idx)
-
-    if len(top_two_idx) == 1:
-        center = bin_centers[top_two_idx[0]]
-        return [(center, values)]
-
-    # two peaks -> split at the valley (minimum) between them
-    i1, i2 = top_two_idx
-    valley_local_idx = i1 + np.argmin(smoothed[i1:i2 + 1])
-    valley_value = bin_centers[valley_local_idx]
-
-    group1 = values[values <= valley_value]
-    group2 = values[values > valley_value]
-
-    if group1.size == 0 or group2.size == 0:
-        # fallback: treat as a single dominant peak
-        center = bin_centers[top_two_idx[np.argmax(heights)]]
-        return [(center, values)]
-
-    center1 = bin_centers[i1]
-    center2 = bin_centers[i2]
-    return [(center1, group1), (center2, group2)]
-
-
-def _cv_percent(group_values):
-    mean = float(np.mean(group_values))
-    std = float(np.std(group_values))
-    if mean == 0:
-        return None
-    return (std / mean) * 100.0
-
-
 def peek_channels_and_files(uploaded_files):
-    """Parse just the first file (lightweight) to list available numeric channels,
-    and return the full filename list for standard-selection."""
     channels = []
     if uploaded_files:
         try:
@@ -114,9 +184,9 @@ def peek_channels_and_files(uploaded_files):
     return channels, filenames
 
 
-# ------------------------- Core analysis -------------------------
+# ------------------------- Core batch analysis -------------------------
 
-def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
+def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel):
     try:
         if not uploaded_files:
             return "No files were uploaded. Please upload one or more .fcs files.", pd.DataFrame(), None
@@ -125,15 +195,14 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
         combined_stats_rows = []
         combined_preview_frames = []
 
-        # first pass: compute 2C-peak mean for every file (needed for sample/standard ratio)
-        peak2c_means = {}
-
         success_count = 0
         failure_count = 0
         error_messages = []
 
         parsed_cache = {}
+        fit_cache = {}
 
+        # first pass: parse + fit every file so we know the standard's 2C peak
         for uploaded_file in uploaded_files:
             filename = uploaded_file.name
             try:
@@ -145,17 +214,18 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
 
                 numeric_data = data.select_dtypes(include="number")
                 if dna_channel in numeric_data.columns:
-                    peaks = _detect_peaks(numeric_data[dna_channel].values)
-                    if peaks:
-                        peak2c_means[filename] = peaks[0][0]
+                    fit_cache[filename] = fit_ploidy_peaks(numeric_data[dna_channel].values, min_channel=min_channel)
             except Exception:
-                pass  # handled fully in the main loop below
+                pass
 
-        standard_2c_mean = peak2c_means.get(standard_filename) if standard_filename else None
+        standard_2c_mean = None
+        if standard_filename and standard_filename in fit_cache:
+            peaks = fit_cache[standard_filename]["peaks"]
+            if peaks:
+                standard_2c_mean = peaks[0]["mu"]
 
         for uploaded_file in uploaded_files:
             filename = uploaded_file.name
-
             try:
                 if filename not in parsed_cache:
                     raise ValueError("File failed to parse.")
@@ -189,7 +259,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
                         "Explained Variance Ratio": None,
                     })
 
-                # --- ploidy peak detection on the chosen DNA channel ---
+                # --- Gaussian-fitted ploidy peaks ---
                 two_peak_cv = ""
                 three_peak = ""
                 three_peak_cv = ""
@@ -197,26 +267,25 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
                 rako_sample_std = ""
                 date_fcm = meta.get("$DATE", "") if isinstance(meta, dict) else ""
 
-                if dna_channel in numeric_data.columns:
-                    peaks = _detect_peaks(numeric_data[dna_channel].values)
-                    if len(peaks) >= 1:
-                        c1, g1 = peaks[0]
-                        cv1 = _cv_percent(g1)
-                        two_peak_cv = round(cv1, 3) if cv1 is not None else ""
+                fit = fit_cache.get(filename)
+                if fit and fit["success"]:
+                    peaks = fit["peaks"]
+                    if len(peaks) >= 1 and peaks[0]["cv_percent"] is not None:
+                        two_peak_cv = round(peaks[0]["cv_percent"], 3)
                     if len(peaks) == 2:
-                        c2, g2 = peaks[1]
-                        cv2 = _cv_percent(g2)
-                        three_peak = round(float(np.mean(g2)), 3)
-                        three_peak_cv = round(cv2, 3) if cv2 is not None else ""
-                        if np.mean(g1) != 0:
-                            rako_endo_embryo = round(float(np.mean(g2) / np.mean(g1)), 4)
+                        three_peak = round(float(peaks[1]["mu"]), 3)
+                        if peaks[1]["cv_percent"] is not None:
+                            three_peak_cv = round(peaks[1]["cv_percent"], 3)
+                        if peaks[0]["mu"] != 0:
+                            rako_endo_embryo = round(float(peaks[1]["mu"] / peaks[0]["mu"]), 4)
 
-                    if standard_2c_mean and filename != standard_filename:
-                        my_2c = peak2c_means.get(filename)
-                        if my_2c and standard_2c_mean != 0:
-                            rako_sample_std = round(float(my_2c / standard_2c_mean), 4)
-                    elif filename == standard_filename:
-                        rako_sample_std = 1.0
+                    if standard_2c_mean:
+                        if filename == standard_filename:
+                            rako_sample_std = 1.0
+                        elif peaks:
+                            my_2c = peaks[0]["mu"]
+                            if standard_2c_mean != 0:
+                                rako_sample_std = round(float(my_2c / standard_2c_mean), 4)
 
                 summary_row = {
                     "File": filename,
@@ -229,7 +298,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
                     "raKo_sample/standard": rako_sample_std,
                     "raKo_endosperm/embryo": rako_endo_embryo,
                     "date_FCM": date_fcm,
-                    "notes": "",
+                    "notes": "" if (fit and fit["success"]) else (fit["note"] if fit else "DNA channel not found"),
                 }
                 batch_summary_rows.append(summary_row)
 
@@ -283,9 +352,10 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename):
 st.set_page_config(page_title="Flow Cytometry Batch Analysis", layout="wide")
 st.title("Flow Cytometry Batch Analysis")
 st.write(
-    "Upload one or more .fcs files. The app auto-detects the two ploidy peaks (2C/embryo and "
-    "3C/endosperm) on your chosen DNA-fluorescence channel, computes their CV%, the "
-    "endosperm/embryo ratio, and (if you designate an internal standard) the sample/standard ratio."
+    "Upload one or more .fcs files. The app fits Gaussian curve(s) to the ploidy peak(s) on your "
+    "chosen DNA-fluorescence channel -- the same approach used by standard flow cytometry analysis "
+    "software -- and reports fitted peak position, CV%, endosperm/embryo ratio, and (if you designate "
+    "an internal standard) the sample/standard ratio."
 )
 
 uploaded_files = st.file_uploader(
@@ -294,25 +364,64 @@ uploaded_files = st.file_uploader(
 
 dna_channel = None
 standard_filename = "None"
+min_channel = 0.0
 
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         if channels:
             dna_channel = st.selectbox(
-                "DNA / PI Fluorescence Channel (used for peak detection)",
+                "DNA / PI Fluorescence Channel",
                 options=channels,
-                help="Pick the channel that represents DNA content / propidium iodide fluorescence, e.g. FL2-A, FL3-A, PE-A.",
+                help="Channel representing DNA content / PI fluorescence.",
             )
         else:
-            st.warning("Could not read channel names from the first file. Check that it's a valid .fcs file.")
+            st.warning("Could not read channel names from the first file.")
     with col2:
         standard_filename = st.selectbox(
-            "Internal Standard file (optional, for sample/standard ratio)",
-            options=["None"] + filenames,
+            "Internal Standard file (optional)", options=["None"] + filenames,
         )
+    with col3:
+        min_channel = st.number_input(
+            "Debris cutoff (exclude events below this channel value)",
+            min_value=0.0, value=0.0, step=100.0,
+            help="Set this above any debris peak near the origin, based on the preview plot below.",
+        )
+
+    st.subheader("Preview: check the fit before running the full batch")
+    preview_file_name = st.selectbox("File to preview", options=filenames, key="preview_select")
+    if st.button("Generate Preview") and dna_channel:
+        preview_file = next(f for f in uploaded_files if f.name == preview_file_name)
+        try:
+            _, pdata = _parse_fcs(preview_file)
+            pdata = pdata.dropna()
+            pnumeric = pdata.select_dtypes(include="number")
+            if dna_channel not in pnumeric.columns:
+                st.error(f"Channel '{dna_channel}' not found in this file.")
+            else:
+                fit = fit_ploidy_peaks(pnumeric[dna_channel].values, min_channel=min_channel)
+                fig, ax = plt.subplots(figsize=(8, 4))
+                if fit["hist"] is not None:
+                    bc, h = fit["hist"]
+                    ax.bar(bc, h, width=(bc[1] - bc[0]) if len(bc) > 1 else 1, alpha=0.5, label="Histogram")
+                if fit["fit_curve"] is not None:
+                    xf, yf = fit["fit_curve"]
+                    ax.plot(xf, yf, color="red", linewidth=2, label="Gaussian fit")
+                ax.set_xlabel(dna_channel)
+                ax.set_ylabel("Event count")
+                ax.legend()
+                st.pyplot(fig)
+
+                if fit["success"]:
+                    for i, p in enumerate(fit["peaks"]):
+                        cv_txt = f"{p['cv_percent']:.2f}%" if p["cv_percent"] is not None else "N/A"
+                        st.write(f"Peak {i + 1}: mu={p['mu']:.1f}, CV={cv_txt}")
+                else:
+                    st.warning(fit["note"])
+        except Exception as preview_err:
+            st.error(f"Preview failed: {preview_err}")
 
 if st.button("Run Batch Analysis", type="primary"):
     if not uploaded_files:
@@ -322,7 +431,9 @@ if st.button("Run Batch Analysis", type="primary"):
     else:
         std_name = None if standard_filename == "None" else standard_filename
         with st.spinner("Processing files..."):
-            summary_text, preview_df, excel_bytes = analyze_fcs_batch(uploaded_files, dna_channel, std_name)
+            summary_text, preview_df, excel_bytes = analyze_fcs_batch(
+                uploaded_files, dna_channel, std_name, min_channel
+            )
 
         st.subheader("Processing Summary")
         st.text(summary_text)
