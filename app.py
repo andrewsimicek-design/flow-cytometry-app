@@ -9,7 +9,6 @@ import pandas as pd
 import fcsparser
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 
 OUTPUT_XLSX_NAME = "batch_flow_cytometry_analysis.xlsx"
@@ -42,56 +41,70 @@ def _multi_gaussian(x, *params):
     return y
 
 
-def _rough_sigma(smoothed, bin_centers, idx, left_bound_idx, right_bound_idx):
-    """Half-max width around a candidate peak, clipped so it can't cross into a neighboring peak."""
-    amp0 = smoothed[idx]
-    half = amp0 / 2.0
-    li, ri = idx, idx
-    while li > left_bound_idx and smoothed[li] > half:
-        li -= 1
-    while ri < right_bound_idx and smoothed[ri] > half:
-        ri += 1
-    bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
-    return max((bin_centers[ri] - bin_centers[li]) / 2.355, bin_width)
-
-
-def _fit_n_gaussians(x_fit, y_fit, components, values_min, values_max, bin_width):
-    """Fit a sum of Gaussians given initial guesses `components` (list of dicts with amp/mu/sigma)."""
-    p0, lower, upper = [], [], []
-    sigma_floor = max(bin_width * 1.5, 1e-6)
-    for c in components:
-        p0.extend([c["amp"], c["mu"], max(c["sigma"], sigma_floor * 2)])
-        lower.extend([0, values_min, sigma_floor])
-        upper.extend([np.inf, values_max, values_max])
-    popt, _ = curve_fit(_multi_gaussian, x_fit, y_fit, p0=p0, bounds=(lower, upper), maxfev=30000)
-    fitted = []
-    for i in range(0, len(popt), 3):
-        amp, mu, sigma = popt[i:i + 3]
-        cv = abs(sigma / mu) * 100 if mu != 0 else None
-        fitted.append({"mu": mu, "sigma": sigma, "amp": amp, "cv_percent": cv})
-    return fitted, _multi_gaussian(x_fit, *popt)
-
-
-def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
-                      min_prominence_frac=0.03, min_distance_frac=0.015, max_peaks=3,
-                      residual_prominence_frac=0.06):
+def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_hist, n_restarts, rng):
     """
-    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values,
-    using an iterative residual (peak-stripping) approach:
+    Try to fit exactly `n_peaks` Gaussians to the histogram using `n_restarts` random
+    initial guesses (random peak positions/widths/heights each time), keeping whichever
+    restart converges to the lowest sum-of-squared-error fit. This is what lets small or
+    off-position peaks get found even when a single "smart guess" attempt would miss them --
+    across many random starting points, at least one is likely to land near the true peak.
+    """
+    span = max(values_max - values_min, 1e-6)
+    sigma_floor = max(bin_width * 1.2, 1e-6)
+    best = None  # (sse, peaks, curve)
+
+    for _ in range(n_restarts):
+        mus0 = np.sort(rng.uniform(values_min, values_max, n_peaks))
+        sigmas0 = rng.uniform(max(sigma_floor, span * 0.003), span * 0.3, n_peaks)
+        amps0 = rng.uniform(0.05 * max_hist, max(max_hist * 1.2, 1.0), n_peaks)
+
+        p0, lower, upper = [], [], []
+        for i in range(n_peaks):
+            p0.extend([amps0[i], mus0[i], sigmas0[i]])
+            lower.extend([0, values_min, sigma_floor])
+            upper.extend([np.inf, values_max, span])
+
+        try:
+            popt, _ = curve_fit(_multi_gaussian, x_fit, y_fit, p0=p0, bounds=(lower, upper), maxfev=4000)
+        except Exception:
+            continue
+
+        model = _multi_gaussian(x_fit, *popt)
+        sse = float(np.sum((model - y_fit) ** 2))
+
+        if best is None or sse < best[0]:
+            peaks = []
+            for i in range(0, len(popt), 3):
+                amp, mu, sigma = popt[i:i + 3]
+                cv = abs(sigma / mu) * 100 if mu != 0 else None
+                peaks.append({"mu": float(mu), "sigma": float(sigma), "amp": float(amp), "cv_percent": cv})
+            peaks.sort(key=lambda p: p["mu"])
+            best = (sse, peaks, model)
+
+    return best
+
+
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42):
+    """
+    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values
+    using a multi-start global search:
 
       1. Exclude events below `min_channel` (debris cutoff).
-      2. Fit the single tallest peak first.
-      3. Subtract that fit from the histogram, leaving a residual.
-      4. Search the RESIDUAL for the next-largest unexplained bump. This catches small
-         or off-position peaks that are hidden in another peak's shoulder/tail and
-         would never show up as their own local maximum in the raw histogram.
-      5. If a significant residual bump is found and max_peaks hasn't been reached, add
-         it as a new component and refit ALL components together against the ORIGINAL
-         histogram (not the residual) so previously-fit peaks are refined too.
-      6. Repeat until no significant residual remains or max_peaks is reached.
+      2. For EVERY candidate peak count n = 1, 2, ..., max_peaks: try `n_restarts` random
+         initial guesses (random positions/widths/heights) and keep the best-converging fit
+         for that n. This brute-force restart strategy is what catches small or off-position
+         peaks a single "smart initial guess" attempt would miss.
+      3. Compare the best fit for each n using BIC (Bayesian Information Criterion), which
+         rewards a lower fitting error but penalizes extra peaks -- this automatically avoids
+         hallucinating extra peaks out of noise while still using more peaks when they
+         genuinely explain the data better.
+      4. Report the peak count / fit that wins that comparison.
 
     CV% is computed from the FITTED sigma/mu -- the standard convention in cytometry
     analysis software, robust to overlapping/off-position peaks.
+
+    A fixed random seed is used by default so repeated runs on the same data give the
+    same result (important for reproducible scientific reporting).
 
     Returns a dict:
       {
@@ -116,83 +129,45 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, smooth_window=5,
     result["hist"] = (bin_centers, hist)
     bin_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 1.0
 
-    kernel = np.ones(smooth_window) / smooth_window
-    smoothed = np.convolve(hist, kernel, mode="same")
     x_fit = bin_centers
     y_fit = hist.astype(float)
-    n_bins = len(smoothed)
+    max_hist = float(hist.max())
+    n_data = len(y_fit)
 
-    global_max = smoothed.max()
-    if global_max <= 0:
+    if max_hist <= 0:
         result["note"] = "No signal in histogram."
         return result
 
-    # --- seed with the single tallest peak ---
-    seed_prom = max(global_max * min_prominence_frac, 1e-9)
-    seed_dist = max(int(bins * min_distance_frac), 1)
-    peak_idx, _ = find_peaks(smoothed, prominence=seed_prom, distance=seed_dist)
-    if len(peak_idx) == 0:
-        result["note"] = "No peaks detected."
+    rng = np.random.default_rng(seed)
+
+    results_by_n = {}
+    for n_peaks in range(1, max_peaks + 1):
+        best = _fit_fixed_n(
+            x_fit, y_fit, n_peaks, values.min(), values.max(), bin_width, max_hist, n_restarts, rng
+        )
+        if best is not None:
+            results_by_n[n_peaks] = best
+
+    if not results_by_n:
+        result["note"] = "No peaks could be fit."
         return result
 
-    tallest = peak_idx[np.argmax(smoothed[peak_idx])]
-    components = [{
-        "amp": smoothed[tallest], "mu": bin_centers[tallest],
-        "sigma": _rough_sigma(smoothed, bin_centers, tallest, 0, n_bins - 1),
-    }]
+    def bic(sse, n_peaks):
+        sse = max(sse, 1e-9)
+        k = 3 * n_peaks  # 3 params (amp, mu, sigma) per peak
+        return n_data * np.log(sse / n_data) + k * np.log(n_data)
 
-    try:
-        fitted, curve = _fit_n_gaussians(x_fit, y_fit, components, values.min(), values.max(), bin_width)
-    except Exception as fit_err:
-        result["note"] = f"Initial peak fit failed: {fit_err}"
-        return result
+    best_n = min(results_by_n.keys(), key=lambda n: bic(results_by_n[n][0], n))
+    sse, peaks, curve = results_by_n[best_n]
 
-    min_sep_bins = max(int(bins * 0.03), 3)
-
-    # --- iteratively search the residual for additional (possibly hidden/off-position) peaks ---
-    while len(fitted) < max_peaks:
-        residual = y_fit - curve
-        residual_smoothed = np.convolve(residual, kernel, mode="same")
-
-        res_prom = max(global_max * residual_prominence_frac, 1e-9)
-        res_idx, _ = find_peaks(residual_smoothed, prominence=res_prom, distance=seed_dist)
-
-        # ignore residual candidates too close to an already-fitted peak
-        existing_bin_positions = [np.argmin(np.abs(bin_centers - c["mu"])) for c in fitted]
-        res_idx = [ri for ri in res_idx if all(abs(ri - e) >= min_sep_bins for e in existing_bin_positions)]
-
-        if not res_idx:
-            break
-
-        best_ri = max(res_idx, key=lambda ri: residual_smoothed[ri])
-        new_component = {
-            "amp": max(residual_smoothed[best_ri], bin_width),
-            "mu": bin_centers[best_ri],
-            "sigma": _rough_sigma(residual_smoothed, bin_centers, best_ri, 0, n_bins - 1),
-        }
-
-        trial_components = [{"amp": c["amp"], "mu": c["mu"], "sigma": c["sigma"]} for c in fitted] + [new_component]
-        try:
-            trial_fitted, trial_curve = _fit_n_gaussians(
-                x_fit, y_fit, trial_components, values.min(), values.max(), bin_width
-            )
-        except Exception:
-            break  # adding this peak didn't help -- stop here with what we have
-
-        # accept the extra peak only if it isn't a negligible/degenerate artifact
-        max_amp = max(p["amp"] for p in trial_fitted)
-        if new := next((p for p in trial_fitted if abs(p["mu"] - new_component["mu"]) < bin_width * 5), None):
-            if new["amp"] < 0.04 * max_amp:
-                break
-
-        fitted, curve = trial_fitted, trial_curve
-
-    fitted.sort(key=lambda p: p["mu"])
-    result["peaks"] = fitted
+    result["peaks"] = peaks
     result["fit_curve"] = (x_fit, curve)
     result["success"] = True
-    if len(fitted) > 1:
-        result["note"] = f"Found {len(fitted)} peak(s) via iterative residual search."
+    result["note"] = (
+        f"Selected {best_n}-peak fit (multi-start search, {n_restarts} restarts per peak count, "
+        f"best of {list(results_by_n.keys())} peak-count options via BIC)."
+        if len(results_by_n) > 1 or best_n > 1 else ""
+    )
     return result
 
 
@@ -224,7 +199,7 @@ def peek_channels_and_files(uploaded_files):
 
 # ------------------------- Core batch analysis -------------------------
 
-def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3):
+def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3, n_restarts=50):
     try:
         if not uploaded_files:
             return "No files were uploaded. Please upload one or more .fcs files.", pd.DataFrame(), None
@@ -253,7 +228,8 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                 numeric_data = data.select_dtypes(include="number")
                 if dna_channel in numeric_data.columns:
                     fit_cache[filename] = fit_ploidy_peaks(
-                        numeric_data[dna_channel].values, min_channel=min_channel, max_peaks=max_peaks
+                        numeric_data[dna_channel].values, min_channel=min_channel,
+                        max_peaks=max_peaks, n_restarts=n_restarts
                     )
             except Exception:
                 pass
@@ -414,11 +390,12 @@ dna_channel = None
 standard_filename = "None"
 min_channel = 0.0
 max_peaks = 3
+n_restarts = 50
 
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         if channels:
             dna_channel = st.selectbox(
@@ -444,6 +421,15 @@ if uploaded_files:
             min_value=1, max_value=5, value=3, step=1,
             help="Detects up to this many peaks (e.g. 2C, 3C, 4C), even if some are small or close together.",
         )
+    with col5:
+        n_restarts = st.number_input(
+            "Fit thoroughness (restarts)",
+            min_value=10, max_value=500, value=50, step=10,
+            help=(
+                "Number of random re-attempts per peak count. Higher = more likely to find "
+                "small/off-position peaks, but slower (especially with many files in a batch)."
+            ),
+        )
 
     st.subheader("Preview: check the fit before running the full batch")
     preview_file_name = st.selectbox("File to preview", options=filenames, key="preview_select")
@@ -456,7 +442,10 @@ if uploaded_files:
             if dna_channel not in pnumeric.columns:
                 st.error(f"Channel '{dna_channel}' not found in this file.")
             else:
-                fit = fit_ploidy_peaks(pnumeric[dna_channel].values, min_channel=min_channel, max_peaks=max_peaks)
+                fit = fit_ploidy_peaks(
+                    pnumeric[dna_channel].values, min_channel=min_channel,
+                    max_peaks=max_peaks, n_restarts=n_restarts
+                )
                 fig, ax = plt.subplots(figsize=(8, 4))
                 if fit["hist"] is not None:
                     bc, h = fit["hist"]
@@ -487,7 +476,7 @@ if st.button("Run Batch Analysis", type="primary"):
         std_name = None if standard_filename == "None" else standard_filename
         with st.spinner("Processing files..."):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
-                uploaded_files, dna_channel, std_name, min_channel, max_peaks
+                uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts
             )
 
         st.subheader("Processing Summary")
