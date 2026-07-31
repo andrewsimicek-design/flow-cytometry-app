@@ -153,7 +153,8 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
     return merged
 
 
-def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42):
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42,
+                      max_plausible_cv=20.0):
     """
     Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values
     using a multi-start global search, with a separate background term for debris/baseline:
@@ -166,11 +167,16 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
          initial guesses (random positions/widths/heights/background shape) and keep the
          best-converging fit for that n. This brute-force restart strategy is what catches
          small or off-position peaks a single "smart initial guess" attempt would miss.
-      4. Compare the best fit for each n using BIC (Bayesian Information Criterion), which
-         rewards a lower fitting error but penalizes extra peaks -- this automatically avoids
-         hallucinating extra peaks out of noise while still using more peaks when they
-         genuinely explain the data better.
-      5. Report the peak count / fit that wins that comparison.
+      4. Merge near-duplicate peaks within each candidate (same population split in two).
+      5. QUALITY CONTROL: reject any candidate peak-count whose result contains a peak with
+         CV% above `max_plausible_cv` -- this is the telltale sign of debris/noise being
+         misfit as a fake peak (happens when max_peaks is set higher than the number of real
+         populations actually present, e.g. a single-population sample with max_peaks=3).
+         Only candidates that pass this check are considered further.
+      6. Compare the surviving candidates using BIC (Bayesian Information Criterion), which
+         rewards a lower fitting error but penalizes extra peaks, and report the winner.
+         If NO candidate passes the quality check, falls back to the best unfiltered result
+         and flags this clearly in the returned note.
 
     CV% is computed from the FITTED sigma/mu -- the standard convention in cytometry
     analysis software, robust to overlapping/off-position peaks.
@@ -212,15 +218,25 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
 
     rng = np.random.default_rng(seed)
 
-    results_by_n = {}
+    # Fit every candidate peak count, merging near-duplicates within each one immediately.
+    candidates = {}
     for n_peaks in range(1, max_peaks + 1):
         best = _fit_fixed_n(
             x_fit, y_fit, n_peaks, values.min(), values.max(), bin_width, max_hist, n_restarts, rng
         )
         if best is not None:
-            results_by_n[n_peaks] = best
+            sse, peaks, curve, bg_amp, bg_k = best
+            merged_peaks = _merge_close_peaks(peaks)
+            is_plausible = all(
+                p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv
+                for p in merged_peaks
+            )
+            candidates[n_peaks] = {
+                "sse": sse, "peaks": merged_peaks, "curve": curve,
+                "bg_amp": bg_amp, "bg_k": bg_k, "plausible": is_plausible,
+            }
 
-    if not results_by_n:
+    if not candidates:
         result["note"] = "No peaks could be fit."
         return result
 
@@ -229,20 +245,29 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
         k = 3 * n_peaks + 2  # 3 params/peak + 2 background params, present in every model
         return n_data * np.log(sse / n_data) + k * np.log(n_data)
 
-    best_n = min(results_by_n.keys(), key=lambda n: bic(results_by_n[n][0], n))
-    sse, peaks, curve, bg_amp, bg_k = results_by_n[best_n]
-    peaks = _merge_close_peaks(peaks)
+    plausible_ns = [n for n, c in candidates.items() if c["plausible"]]
+    pool = plausible_ns if plausible_ns else list(candidates.keys())
+
+    best_n = min(pool, key=lambda n: bic(candidates[n]["sse"], n))
+    chosen = candidates[best_n]
+    sse, peaks, curve, bg_amp, bg_k = chosen["sse"], chosen["peaks"], chosen["curve"], chosen["bg_amp"], chosen["bg_k"]
 
     result["peaks"] = peaks
     result["fit_curve"] = (x_fit, curve)
     result["success"] = True
     merge_note = " (2 near-duplicate peaks merged into 1)" if len(peaks) < best_n else ""
+    qc_note = ""
+    if not plausible_ns:
+        qc_note = " QUALITY WARNING: no peak-count option passed the plausibility check (CV too high) -- showing best available anyway."
+    elif len(plausible_ns) < len(candidates):
+        rejected = sorted(set(candidates.keys()) - set(plausible_ns))
+        qc_note = f" (rejected implausible fit(s) at peak-count {rejected} -- CV% too high, likely debris misfit as a peak)"
     result["note"] = (
-        f"Selected {best_n}-peak fit, {len(peaks)} peak(s) after cleanup{merge_note} "
+        f"Selected {best_n}-peak fit, {len(peaks)} peak(s) after cleanup{merge_note}{qc_note} "
         f"(multi-start search, {n_restarts} restarts per peak count, "
-        f"best of {list(results_by_n.keys())} peak-count options via BIC; background amp={bg_amp:.1f}, "
+        f"best of {list(candidates.keys())} peak-count options via BIC; background amp={bg_amp:.1f}, "
         f"decay k={bg_k:.5f})."
-        if len(results_by_n) > 1 or best_n > 1 else ""
+        if len(candidates) > 1 or best_n > 1 or qc_note else ""
     )
     return result
 
@@ -275,7 +300,8 @@ def peek_channels_and_files(uploaded_files):
 
 # ------------------------- Core batch analysis -------------------------
 
-def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3, n_restarts=50):
+def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3,
+                       n_restarts=50, max_plausible_cv=20.0):
     try:
         if not uploaded_files:
             return "No files were uploaded. Please upload one or more .fcs files.", pd.DataFrame(), None
@@ -305,7 +331,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                 if dna_channel in numeric_data.columns:
                     fit_cache[filename] = fit_ploidy_peaks(
                         numeric_data[dna_channel].values, min_channel=min_channel,
-                        max_peaks=max_peaks, n_restarts=n_restarts
+                        max_peaks=max_peaks, n_restarts=n_restarts, max_plausible_cv=max_plausible_cv
                     )
             except Exception:
                 pass
@@ -467,6 +493,7 @@ standard_filename = "None"
 min_channel = 0.0
 max_peaks = 3
 n_restarts = 50
+max_plausible_cv = 20.0
 
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
@@ -507,6 +534,39 @@ if uploaded_files:
             ),
         )
 
+    with st.expander("Advanced: peak quality control"):
+        max_plausible_cv = st.number_input(
+            "Max plausible peak CV% (reject fits above this)",
+            min_value=1.0, max_value=100.0, value=20.0, step=1.0,
+            help=(
+                "If a peak's fitted CV% exceeds this, that peak-count option is automatically "
+                "rejected and the app falls back to fewer peaks -- this is what prevents debris/noise "
+                "from being misfit as a fake extra peak on single-population samples "
+                "(e.g. 'only_endosperm' or 'only_embryo' files). Lower this if you want stricter "
+                "quality control; raise it if genuinely noisy samples are being rejected too "
+                "aggressively."
+            ),
+        )
+
+    with st.expander("Advanced: peak quality control"):
+        max_plausible_cv = st.number_input(
+            "Max plausible peak CV% (reject fits above this)",
+            min_value=1.0, max_value=100.0, value=20.0, step=1.0,
+            help=(
+                "Real ploidy peaks are almost always well under this. Any candidate peak-count "
+                "whose fit includes a peak above this CV% is rejected as likely debris/noise "
+                "misfit as a fake peak, and the app automatically falls back to fewer peaks. "
+                "If a file genuinely should have a noisier real peak, raise this value for that batch."
+            ),
+        )
+        st.caption(
+            "If you set 'Max peaks to detect' higher than the number of real populations a sample "
+            "actually has (e.g. a single-population 'only endosperm' or 'only embryo' file), the "
+            "leftover peak slot can otherwise get spent fitting debris/noise instead of being left "
+            "unused. This filter catches that automatically -- check the batch summary's PCA Note / "
+            "fit note column if a file's peak count looks lower than expected, it'll explain why."
+        )
+
     st.subheader("Preview: check the fit before running the full batch")
     preview_file_name = st.selectbox("File to preview", options=filenames, key="preview_select")
     if st.button("Generate Preview") and dna_channel:
@@ -520,7 +580,7 @@ if uploaded_files:
             else:
                 fit = fit_ploidy_peaks(
                     pnumeric[dna_channel].values, min_channel=min_channel,
-                    max_peaks=max_peaks, n_restarts=n_restarts
+                    max_peaks=max_peaks, n_restarts=n_restarts, max_plausible_cv=max_plausible_cv
                 )
                 fig, ax = plt.subplots(figsize=(8, 4))
                 if fit["hist"] is not None:
@@ -552,7 +612,7 @@ if st.button("Run Batch Analysis", type="primary"):
         std_name = None if standard_filename == "None" else standard_filename
         with st.spinner("Processing files..."):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
-                uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts
+                uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts, max_plausible_cv
             )
 
         st.subheader("Processing Summary")
