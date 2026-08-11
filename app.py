@@ -23,6 +23,7 @@ TRACKING_FIELDS = [
     "raKo_endosperm/embryo",
     "date_FCM",
     "notes",
+    "Ploidy",          # <-- new
 ]
 
 
@@ -386,6 +387,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                 rako_endo_embryo = ""
                 rako_sample_std = ""
                 date_fcm = meta.get("$DATE", "") if isinstance(meta, dict) else ""
+                ploidy_label = ""
 
                 fit = fit_cache.get(filename)
                 if fit and fit["success"]:
@@ -411,6 +413,28 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                             if standard_2c_mean != 0:
                                 rako_sample_std = round(float(my_2c / standard_2c_mean), 4)
 
+                    # ---- Ploidy classification (NEW) ----
+                    if standard_2c_mean is not None and peaks:
+                        ratios = [p["mu"] / standard_2c_mean for p in peaks]
+                        labels = []
+                        for r in ratios:
+                            if 0.9 <= r <= 1.1:
+                                labels.append("2C")
+                            elif 1.4 <= r <= 1.6:
+                                labels.append("3C")
+                            elif 1.9 <= r <= 2.1:
+                                labels.append("4C")
+                            else:
+                                labels.append("aneuploid")
+                        if len(labels) == 1:
+                            ploidy_label = labels[0]
+                        else:
+                            ploidy_label = "+".join(labels)
+                    elif standard_2c_mean is None:
+                        ploidy_label = "No standard"
+                    else:
+                        ploidy_label = "No peaks"
+
                 summary_row = {
                     "File": filename,
                     "Total Events (post-cleaning)": int(numeric_data.shape[0]),
@@ -425,6 +449,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                     "raKo_endosperm/embryo": rako_endo_embryo,
                     "date_FCM": date_fcm,
                     "notes": "" if (fit and fit["success"]) else (fit["note"] if fit else "DNA channel not found"),
+                    "Ploidy": ploidy_label,   # <-- new
                 }
                 batch_summary_rows.append(summary_row)
 
@@ -545,18 +570,6 @@ if uploaded_files:
                 "(e.g. 'only_endosperm' or 'only_embryo' files). Lower this if you want stricter "
                 "quality control; raise it if genuinely noisy samples are being rejected too "
                 "aggressively."
-            ),
-        )
-
-    with st.expander("Advanced: peak quality control"):
-        max_plausible_cv = st.number_input(
-            "Max plausible peak CV% (reject fits above this)",
-            min_value=1.0, max_value=100.0, value=20.0, step=1.0,
-            help=(
-                "Real ploidy peaks are almost always well under this. Any candidate peak-count "
-                "whose fit includes a peak above this CV% is rejected as likely debris/noise "
-                "misfit as a fake peak, and the app automatically falls back to fewer peaks. "
-                "If a file genuinely should have a noisier real peak, raise this value for that batch."
             ),
         )
         st.caption(
