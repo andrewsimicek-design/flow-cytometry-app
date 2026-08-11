@@ -603,6 +603,9 @@ if uploaded_files:
         except Exception as preview_err:
             st.error(f"Preview failed: {preview_err}")
 
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = None
+
 if st.button("Run Batch Analysis", type="primary"):
     if not uploaded_files:
         st.warning("Please upload at least one .fcs file first.")
@@ -614,18 +617,29 @@ if st.button("Run Batch Analysis", type="primary"):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
                 uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts, max_plausible_cv
             )
+        # store in session_state so results (incl. the download button) survive
+        # Streamlit reruns -- e.g. the app waking up from sleep, or any other
+        # widget interaction -- instead of disappearing after the button's
+        # one-shot "clicked" state resets on the next rerun.
+        st.session_state.batch_results = (summary_text, preview_df, excel_bytes)
 
-        st.subheader("Processing Summary")
-        st.text(summary_text)
+if st.session_state.batch_results is not None:
+    summary_text, preview_df, excel_bytes = st.session_state.batch_results
 
-        st.subheader("Batch Summary Preview")
-        st.dataframe(preview_df, use_container_width=True)
+    st.subheader("Processing Summary")
+    st.text(summary_text)
 
-        if excel_bytes is not None:
-            st.subheader("Download Master Excel Report")
-            st.download_button(
-                label=f"Download {OUTPUT_XLSX_NAME}",
-                data=excel_bytes,
-                file_name=OUTPUT_XLSX_NAME,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    st.subheader("Batch Summary Preview")
+    st.dataframe(preview_df, use_container_width=True)
+
+    if excel_bytes is not None:
+        st.subheader("Download Master Excel Report")
+        st.download_button(
+            label=f"Download {OUTPUT_XLSX_NAME}",
+            data=excel_bytes,
+            file_name=OUTPUT_XLSX_NAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if st.button("Clear results"):
+            st.session_state.batch_results = None
+            st.rerun()
