@@ -23,8 +23,51 @@ TRACKING_FIELDS = [
     "raKo_endosperm/embryo",
     "date_FCM",
     "notes",
-    "Ploidy",          # <-- new
+    "Ploidy",
 ]
+
+
+# ------------------------- Ploidy classification helper -------------------------
+def _classify_ploidy(peaks, tolerance=0.20):
+    """
+    Classify ploidy based on internal peak ratios.
+    Uses the first (lowest) peak as 2x.
+    Returns e.g. "2x", "2x+4x", "2x+4x+6x", "aneuploid", etc.
+    """
+    if not peaks:
+        return "No peaks"
+
+    base = peaks[0]["mu"]
+    ratios = [p["mu"] / base for p in peaks]
+
+    # expected ratios and their ploidy labels (using "x" notation)
+    expected = {
+        1.0: "2x",
+        1.5: "3x",
+        2.0: "4x",
+        3.0: "6x",
+        4.0: "8x",
+        # add more if needed (e.g., 5x? but rare)
+    }
+
+    labels = []
+    for r in ratios:
+        best_label = None
+        best_diff = float('inf')
+        for exp, label in expected.items():
+            diff = abs(r - exp) / exp  # relative difference
+            if diff < best_diff:
+                best_diff = diff
+                best_label = label
+        if best_diff <= tolerance:
+            labels.append(best_label)
+        else:
+            labels.append("aneuploid")
+
+    if len(labels) == 1:
+        return labels[0]
+    else:
+        return "+".join(labels)
 
 
 # ------------------------- Gaussian fitting core -------------------------
@@ -45,12 +88,6 @@ def _multi_gaussian(x, *params):
 def _make_model_with_background(x_min):
     """
     Build a model function: exponential-decay BACKGROUND + sum of N Gaussian PEAKS.
-
-    The background term absorbs broad, slowly-decaying debris/noise baseline (very
-    common in flow cytometry histograms: lots of small events at low channels, tailing
-    off toward higher channels). Without it, that baseline "hump" competes with genuine
-    small peaks for a limited peak budget and can get modeled as a fake broad peak
-    instead -- which was hiding real, smaller peaks (e.g. a real 3rd peak) from being found.
     """
     def _model(x, bg_amp, bg_k, *gauss_params):
         bg = bg_amp * np.exp(-bg_k * (x - x_min))
@@ -60,18 +97,12 @@ def _make_model_with_background(x_min):
 
 def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_hist, n_restarts, rng):
     """
-    Try to fit exactly `n_peaks` Gaussian PEAKS plus one background term to the histogram,
-    using `n_restarts` random initial guesses (random peak positions/widths/heights/background
-    shape each time), keeping whichever restart converges to the lowest sum-of-squared-error
-    fit. This is what lets small or off-position peaks get found even when a single "smart
-    guess" attempt would miss them -- across many random starting points, at least one is
-    likely to land near each true peak, and the background term keeps debris/baseline noise
-    from stealing a peak slot.
+    Try to fit exactly `n_peaks` Gaussian PEAKS plus one background term.
     """
     span = max(values_max - values_min, 1e-6)
     sigma_floor = max(bin_width * 1.2, 1e-6)
     model_func = _make_model_with_background(values_min)
-    best = None  # (sse, peaks, curve, bg_amp, bg_k)
+    best = None
 
     for _ in range(n_restarts):
         bg_amp0 = rng.uniform(0, max_hist * 0.6)
@@ -113,12 +144,7 @@ def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_h
 
 def _merge_close_peaks(peaks, min_separation_sigma=1.0):
     """
-    Merge fitted peaks that are really the same underlying population split into two
-    near-duplicate Gaussians (can happen when the optimizer finds a slightly-lower-SSE
-    solution by "cheating" with two overlapping components instead of one honest peak).
-    Two peaks are merged if their centers are closer than `min_separation_sigma` times
-    their average sigma. Merging uses proper Gaussian-mixture moment matching so the
-    combined peak's mu/sigma/amp represent the pooled population, not just one of the two.
+    Merge fitted peaks that are really the same underlying population split in two.
     """
     if len(peaks) < 2:
         return peaks
@@ -157,42 +183,7 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42,
                       max_plausible_cv=20.0):
     """
-    Detect and Gaussian-fit up to `max_peaks` ploidy peaks in a 1D array of channel values
-    using a multi-start global search, with a separate background term for debris/baseline:
-
-      1. Exclude events below `min_channel` (debris cutoff).
-      2. The fit model is: exponential-decay BACKGROUND + N Gaussian PEAKS. The background
-         absorbs broad, low, slowly-decaying debris noise so it can't masquerade as (or hide)
-         a real peak.
-      3. For EVERY candidate peak count n = 1, 2, ..., max_peaks: try `n_restarts` random
-         initial guesses (random positions/widths/heights/background shape) and keep the
-         best-converging fit for that n. This brute-force restart strategy is what catches
-         small or off-position peaks a single "smart initial guess" attempt would miss.
-      4. Merge near-duplicate peaks within each candidate (same population split in two).
-      5. QUALITY CONTROL: reject any candidate peak-count whose result contains a peak with
-         CV% above `max_plausible_cv` -- this is the telltale sign of debris/noise being
-         misfit as a fake peak (happens when max_peaks is set higher than the number of real
-         populations actually present, e.g. a single-population sample with max_peaks=3).
-         Only candidates that pass this check are considered further.
-      6. Compare the surviving candidates using BIC (Bayesian Information Criterion), which
-         rewards a lower fitting error but penalizes extra peaks, and report the winner.
-         If NO candidate passes the quality check, falls back to the best unfiltered result
-         and flags this clearly in the returned note.
-
-    CV% is computed from the FITTED sigma/mu -- the standard convention in cytometry
-    analysis software, robust to overlapping/off-position peaks.
-
-    A fixed random seed is used by default so repeated runs on the same data give the
-    same result (important for reproducible scientific reporting).
-
-    Returns a dict:
-      {
-        "success": bool,
-        "peaks": [ {"mu": ..., "sigma": ..., "amp": ..., "cv_percent": ...}, ... ] (ascending mu),
-        "hist": (bin_centers, hist_counts),
-        "fit_curve": (x_smooth, y_smooth) or None,
-        "note": str
-      }
+    Detect and Gaussian-fit up to `max_peaks` ploidy peaks.
     """
     values = np.asarray(values, dtype=float)
     values = values[values >= min_channel]
@@ -219,7 +210,6 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
 
     rng = np.random.default_rng(seed)
 
-    # Fit every candidate peak count, merging near-duplicates within each one immediately.
     candidates = {}
     for n_peaks in range(1, max_peaks + 1):
         best = _fit_fixed_n(
@@ -243,7 +233,7 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
 
     def bic(sse, n_peaks):
         sse = max(sse, 1e-9)
-        k = 3 * n_peaks + 2  # 3 params/peak + 2 background params, present in every model
+        k = 3 * n_peaks + 2
         return n_data * np.log(sse / n_data) + k * np.log(n_data)
 
     plausible_ns = [n for n, c in candidates.items() if c["plausible"]]
@@ -413,27 +403,8 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                             if standard_2c_mean != 0:
                                 rako_sample_std = round(float(my_2c / standard_2c_mean), 4)
 
-                    # ---- Ploidy classification (NEW) ----
-                    if standard_2c_mean is not None and peaks:
-                        ratios = [p["mu"] / standard_2c_mean for p in peaks]
-                        labels = []
-                        for r in ratios:
-                            if 0.9 <= r <= 1.1:
-                                labels.append("2C")
-                            elif 1.4 <= r <= 1.6:
-                                labels.append("3C")
-                            elif 1.9 <= r <= 2.1:
-                                labels.append("4C")
-                            else:
-                                labels.append("aneuploid")
-                        if len(labels) == 1:
-                            ploidy_label = labels[0]
-                        else:
-                            ploidy_label = "+".join(labels)
-                    elif standard_2c_mean is None:
-                        ploidy_label = "No standard"
-                    else:
-                        ploidy_label = "No peaks"
+                    # ---- Ploidy classification using internal ratios (now with "x" labels) ----
+                    ploidy_label = _classify_ploidy(peaks)
 
                 summary_row = {
                     "File": filename,
@@ -449,7 +420,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                     "raKo_endosperm/embryo": rako_endo_embryo,
                     "date_FCM": date_fcm,
                     "notes": "" if (fit and fit["success"]) else (fit["note"] if fit else "DNA channel not found"),
-                    "Ploidy": ploidy_label,   # <-- new
+                    "Ploidy": ploidy_label,
                 }
                 batch_summary_rows.append(summary_row)
 
@@ -547,7 +518,7 @@ if uploaded_files:
         max_peaks = st.number_input(
             "Max peaks to detect",
             min_value=1, max_value=5, value=3, step=1,
-            help="Detects up to this many peaks (e.g. 2C, 3C, 4C), even if some are small or close together.",
+            help="Detects up to this many peaks (e.g. 2x, 4x, 6x), even if some are small or close together.",
         )
     with col5:
         n_restarts = st.number_input(
@@ -630,10 +601,6 @@ if st.button("Run Batch Analysis", type="primary"):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
                 uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts, max_plausible_cv
             )
-        # store in session_state so results (incl. the download button) survive
-        # Streamlit reruns -- e.g. the app waking up from sleep, or any other
-        # widget interaction -- instead of disappearing after the button's
-        # one-shot "clicked" state resets on the next rerun.
         st.session_state.batch_results = (summary_text, preview_df, excel_bytes)
 
 if st.session_state.batch_results is not None:
