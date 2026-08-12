@@ -30,44 +30,37 @@ TRACKING_FIELDS = [
 # ------------------------- Ploidy classification helper -------------------------
 def _classify_ploidy(peaks, tolerance=0.20):
     """
-    Classify ploidy based on internal peak ratios.
-    Uses the first (lowest) peak as 2x.
-    Returns e.g. "2x", "2x+4x", "2x+4x+6x", "aneuploid", etc.
+    Classify ploidy based on the FIRST (lowest) peak only.
+    Returns a single label like "2x", "3x", "4x", "6x", "8x", or "aneuploid".
+    The first peak is always considered the base (ratio = 1.0) and mapped to "2x".
     """
     if not peaks:
         return "No peaks"
 
-    base = peaks[0]["mu"]
-    ratios = [p["mu"] / base for p in peaks]
+    # Use ONLY the first (lowest) peak
+    # Its ratio to itself is always 1.0
+    ratio = 1.0
 
-    # expected ratios and their ploidy labels (using "x" notation)
     expected = {
         1.0: "2x",
-        1.5: "3x",
+        1.5: "3x",   # rare as first peak, but included for completeness
         2.0: "4x",
         3.0: "6x",
         4.0: "8x",
-        # add more if needed (e.g., 5x? but rare)
     }
 
-    labels = []
-    for r in ratios:
-        best_label = None
-        best_diff = float('inf')
-        for exp, label in expected.items():
-            diff = abs(r - exp) / exp  # relative difference
-            if diff < best_diff:
-                best_diff = diff
-                best_label = label
-        if best_diff <= tolerance:
-            labels.append(best_label)
-        else:
-            labels.append("aneuploid")
+    best_label = None
+    best_diff = float('inf')
+    for exp, label in expected.items():
+        diff = abs(ratio - exp) / exp
+        if diff < best_diff:
+            best_diff = diff
+            best_label = label
 
-    if len(labels) == 1:
-        return labels[0]
+    if best_diff <= tolerance:
+        return best_label
     else:
-        return "+".join(labels)
+        return "aneuploid"
 
 
 # ------------------------- Gaussian fitting core -------------------------
@@ -368,7 +361,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                         "Explained Variance Ratio": None,
                     })
 
-                # --- Gaussian-fitted ploidy peaks (up to 3: 2C, 3C, 4C) ---
+                # --- Gaussian-fitted ploidy peaks ---
                 two_peak_cv = ""
                 three_peak = ""
                 three_peak_cv = ""
@@ -403,7 +396,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                             if standard_2c_mean != 0:
                                 rako_sample_std = round(float(my_2c / standard_2c_mean), 4)
 
-                    # ---- Ploidy classification using internal ratios (now with "x" labels) ----
+                    # ---- Ploidy classification: single label based on first peak ----
                     ploidy_label = _classify_ploidy(peaks)
 
                 summary_row = {
@@ -477,7 +470,8 @@ st.write(
     "Upload one or more .fcs files. The app fits Gaussian curve(s) to the ploidy peak(s) on your "
     "chosen DNA-fluorescence channel -- the same approach used by standard flow cytometry analysis "
     "software -- and reports fitted peak position, CV%, endosperm/embryo ratio, and (if you designate "
-    "an internal standard) the sample/standard ratio."
+    "an internal standard) the sample/standard ratio. The Ploidy column shows the classification "
+    "of the **first (lowest)** peak only, using internal ratios."
 )
 
 uploaded_files = st.file_uploader(
