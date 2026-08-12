@@ -2,6 +2,7 @@ import os
 import io
 import tempfile
 import traceback
+from datetime import datetime
 
 import numpy as np
 import streamlit as st
@@ -25,7 +26,7 @@ OUTPUT_COLUMNS = [
     "Embryo/Standard",
     "Endosperm/Standard",
     "Endosperm/Embryo",
-    "date_FCM",
+    "date_FCM",   # this will be today's date
 ]
 
 
@@ -261,6 +262,9 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
             if std_peaks:
                 standard_reference_mean = std_peaks[0]["mu"]
 
+        # Get today's date for the report
+        today_date = datetime.now().strftime("%Y-%m-%d")
+
         # Second pass: build summary rows
         for uploaded_file in uploaded_files:
             filename = uploaded_file.name
@@ -269,8 +273,6 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     raise ValueError("File failed to parse.")
                 meta, data = parsed_cache[filename]
                 numeric_data = data.select_dtypes(include="number")
-
-                date_fcm = meta.get("$DATE", "") if isinstance(meta, dict) else ""
 
                 # Initialize values
                 mean_embryo = cv_embryo = ""
@@ -320,7 +322,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     if mean_embryo != "" and mean_endosperm != "":
                         endosperm_embryo = round(float(mean_endosperm / mean_embryo), 4)
 
-                # Build clean row with only required columns
+                # Build clean row with today's date
                 row = {
                     "File": filename,
                     "Embryo Mean": mean_embryo,
@@ -332,12 +334,12 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Embryo/Standard": embryo_standard,
                     "Endosperm/Standard": endosperm_standard,
                     "Endosperm/Embryo": endosperm_embryo,
-                    "date_FCM": date_fcm,
+                    "date_FCM": today_date,   # <-- current date for all rows
                 }
                 batch_summary_rows.append(row)
 
             except Exception:
-                # On error, still add a row with empty values
+                # On error, still add a row with empty values but today's date
                 batch_summary_rows.append({
                     "File": filename,
                     "Embryo Mean": "",
@@ -349,7 +351,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Embryo/Standard": "",
                     "Endosperm/Standard": "",
                     "Endosperm/Embryo": "",
-                    "date_FCM": "",
+                    "date_FCM": today_date,
                 })
 
         batch_summary_df = pd.DataFrame(batch_summary_rows, columns=OUTPUT_COLUMNS)
@@ -372,7 +374,8 @@ st.set_page_config(page_title="Flow Cytometry Analysis", layout="wide")
 st.title("Flow Cytometry Analysis")
 st.write(
     "Upload your `.fcs` files and select the internal standard file. "
-    "The output Excel contains only the peak means, CVs, and ratios – no extra notes."
+    "The output Excel contains only the peak means, CVs, and ratios – no extra notes. "
+    "The date column shows today's date automatically."
 )
 
 uploaded_files = st.file_uploader(
