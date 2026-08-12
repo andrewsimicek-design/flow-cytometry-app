@@ -32,9 +32,6 @@ TRACKING_FIELDS = [
 
 # ------------------------- Ploidy classification (optional) -------------------------
 def _classify_ploidy(peaks, tolerance=0.20):
-    """
-    Simple classification based on the first (lowest) peak as 2x.
-    """
     if not peaks:
         return "No peaks"
     ratio = 1.0
@@ -264,8 +261,9 @@ def peek_channels_and_files(uploaded_files):
 
 # ------------------------- Core batch analysis (updated) -------------------------
 def analyze_fcs_batch(uploaded_files, dna_channel,
-                      standard_min_channel, standard_max_channel,
-                      min_channel, max_peaks=3,
+                      standard_filename,
+                      standard_tolerance_percent=20.0,
+                      min_channel=0.0, max_peaks=3,
                       n_restarts=50, max_plausible_cv=20.0):
     try:
         if not uploaded_files:
@@ -300,6 +298,14 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     )
             except Exception:
                 pass
+
+        # ---- Get standard reference peak from the standard file ----
+        standard_reference_mean = None
+        if standard_filename and standard_filename in fit_cache:
+            std_peaks = fit_cache[standard_filename].get("peaks", [])
+            if std_peaks:
+                # Use the first peak (lowest mean) of the standard file as reference
+                standard_reference_mean = std_peaks[0]["mu"]
 
         # Second pass: build summary rows with biological peak assignment
         for uploaded_file in uploaded_files:
@@ -353,13 +359,20 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     peaks = fit["peaks"]  # sorted by mu
                     notes = fit.get("note", "")
 
-                    # ---- Identify Standard peak based on channel range ----
+                    # ---- Identify Standard peak based on reference mean ----
                     std_peak = None
-                    if standard_min_channel > 0 and standard_max_channel > standard_min_channel:
+                    if standard_reference_mean is not None:
+                        # Find peak closest to reference within tolerance
+                        tol = standard_tolerance_percent / 100.0
+                        best_diff = np.inf
                         for p in peaks:
-                            if standard_min_channel <= p["mu"] <= standard_max_channel:
+                            diff = abs(p["mu"] - standard_reference_mean) / standard_reference_mean
+                            if diff < best_diff:
+                                best_diff = diff
                                 std_peak = p
-                                break
+                        # If best diff > tolerance, we don't assign standard
+                        if best_diff > tol:
+                            std_peak = None
 
                     # ---- Separate peaks: embryo (lowest), endosperm (next), standard (identified) ----
                     # Remove standard from list if found
@@ -463,13 +476,13 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
         return f"Fatal error during batch processing:\n{error_trace}", pd.DataFrame(), None
 
 
-# ------------------------- Streamlit UI (updated with standard range inputs) -------------------------
+# ------------------------- Streamlit UI (updated) -------------------------
 st.set_page_config(page_title="Flow Cytometry Batch Analysis", layout="wide")
 st.title("Flow Cytometry Batch Analysis")
 st.write(
-    "Upload one or more `.fcs` files. The app fits Gaussian peaks (with background subtraction) "
-    "and assigns them to **Embryo**, **Endosperm**, and **Standard** based on an expected channel range for the standard. "
-    "Ratios (Embryo/Standard, Endosperm/Standard, Endosperm/Embryo) are calculated accordingly."
+    "Upload your `.fcs` files and select one as the **Internal Standard** (e.g., Bellis_gain417.fcs). "
+    "The app will fit Gaussian peaks, identify the standard peak in each sample (by matching to the standard file's peak), "
+    "assign the remaining peaks as Embryo and Endosperm, and compute the required ratios."
 )
 
 uploaded_files = st.file_uploader(
@@ -477,8 +490,8 @@ uploaded_files = st.file_uploader(
 )
 
 dna_channel = None
-standard_min_channel = 0.0
-standard_max_channel = 0.0
+standard_filename = None
+standard_tolerance_percent = 20.0
 min_channel = 0.0
 max_peaks = 3
 n_restarts = 50
@@ -487,7 +500,7 @@ max_plausible_cv = 20.0
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         if channels:
             dna_channel = st.selectbox(
@@ -497,38 +510,37 @@ if uploaded_files:
             )
         else:
             st.warning("Could not read channel names from the first file.")
-
     with col2:
-        standard_min_channel = st.number_input(
-            "Standard peak min channel",
-            min_value=0.0, value=0.0, step=100.0,
-            help="Lower bound of the expected channel range for the internal standard peak.",
-        )
-    with col3:
-        standard_max_channel = st.number_input(
-            "Standard peak max channel",
-            min_value=0.0, value=0.0, step=100.0,
-            help="Upper bound of the expected channel range for the internal standard peak.",
+        standard_filename = st.selectbox(
+            "Select Internal Standard file",
+            options=filenames,
+            help="Choose the file that contains the internal standard (e.g., Bellis_gain417.fcs)."
         )
 
-    col4, col5, col6, col7 = st.columns(4)
+    col3, col4, col5, col6, col7 = st.columns(5)
+    with col3:
+        standard_tolerance_percent = st.number_input(
+            "Standard peak match tolerance (%)",
+            min_value=5.0, max_value=100.0, value=20.0, step=5.0,
+            help="Relative tolerance for matching a peak to the standard's reference mean."
+        )
     with col4:
         min_channel = st.number_input(
             "Debris cutoff (exclude below this)",
             min_value=0.0, value=0.0, step=100.0,
-            help="Exclude events below this channel value (remove debris).",
+            help="Exclude events below this channel value to remove debris."
         )
     with col5:
         max_peaks = st.number_input(
             "Max peaks to detect",
             min_value=1, max_value=5, value=3, step=1,
-            help="Detects up to this many peaks.",
+            help="Detects up to this many peaks."
         )
     with col6:
         n_restarts = st.number_input(
             "Fit thoroughness (restarts)",
             min_value=10, max_value=500, value=50, step=10,
-            help="Higher = more likely to find small peaks, but slower.",
+            help="Higher = more likely to find small peaks, but slower."
         )
     with col7:
         st.write("")  # spacing
@@ -537,7 +549,7 @@ if uploaded_files:
         max_plausible_cv = st.number_input(
             "Max plausible peak CV% (reject fits above this)",
             min_value=1.0, max_value=100.0, value=20.0, step=1.0,
-            help="Rejects fits with any peak CV% above this threshold.",
+            help="Rejects fits with any peak CV% above this threshold."
         )
         st.caption(
             "If 'Max peaks to detect' is higher than the number of real populations, "
@@ -589,13 +601,14 @@ if st.button("Run Batch Analysis", type="primary"):
         st.warning("Please upload at least one .fcs file first.")
     elif not dna_channel:
         st.warning("Please select a DNA/PI fluorescence channel first.")
-    elif standard_min_channel == 0 and standard_max_channel == 0:
-        st.warning("Please set a valid channel range for the standard peak (min and max).")
+    elif not standard_filename:
+        st.warning("Please select an internal standard file.")
     else:
         with st.spinner("Processing files..."):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
                 uploaded_files, dna_channel,
-                standard_min_channel, standard_max_channel,
+                standard_filename,
+                standard_tolerance_percent,
                 min_channel, max_peaks, n_restarts, max_plausible_cv
             )
         st.session_state.batch_results = (summary_text, preview_df, excel_bytes)
