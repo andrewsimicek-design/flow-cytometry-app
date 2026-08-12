@@ -11,9 +11,23 @@ import fcsparser
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
 
 OUTPUT_XLSX_NAME = "flow_cytometry_analysis.xlsx"
+
+# Minimal output columns – exactly what a manual analysis would report
+OUTPUT_COLUMNS = [
+    "File",
+    "Embryo Mean",
+    "Embryo CV",
+    "Endosperm Mean",
+    "Endosperm CV",
+    "Standard Mean",
+    "Standard CV",
+    "Embryo/Standard",
+    "Endosperm/Standard",
+    "Endosperm/Embryo",
+    "date_FCM",
+]
 
 
 # ------------------------- Gaussian fitting core (unchanged) -------------------------
@@ -115,34 +129,21 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
     return merged
 
 
-def _estimate_peak_count(hist_values, min_distance=5, prominence_rel=0.02):
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42,
+                      max_plausible_cv=20.0, scale_to_1024=True, raw_max=32768):
     """
-    Automatically estimate the number of peaks in a histogram using scipy.signal.find_peaks.
-    """
-    # Use find_peaks with adaptive prominence
-    peak_indices, properties = find_peaks(
-        hist_values,
-        prominence=np.ptp(hist_values) * prominence_rel,
-        distance=min_distance
-    )
-    # Filter out peaks that are too close to the edges
-    # (often just noise or debris)
-    # Return the number of peaks found (cap at 8 to avoid overfitting)
-    return min(len(peak_indices), 8)
-
-
-def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_restarts=50, seed=42,
-                      max_plausible_cv=20.0, scale_to_1024=True, raw_max=32768,
-                      auto_detect_peaks=True, max_peaks=8):
-    """
-    Fit Gaussian peaks to the data. Now with automatic peak detection!
+    Fit Gaussian peaks to the data. If scale_to_1024 is True, rescale raw values
+    to 0-1023 range using the provided raw_max (e.g., 32768 for Partec PAS).
     """
     values = np.asarray(values, dtype=float)
     
-    # ---- SCALING ----
+    # ---- SCALING FIX: map raw values to 1024-channel scale ----
     if scale_to_1024 and raw_max > 0:
         values = values / raw_max * 1023
+        # Optionally clip to 0-1023 (but values shouldn't exceed raw_max)
+        # values = np.clip(values, 0, 1023)
     
+    # Apply debris cutoff after scaling
     values = values[values >= min_channel]
 
     result = {"success": False, "peaks": [], "hist": None, "fit_curve": None, "note": ""}
@@ -167,33 +168,8 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_restarts=50, seed=42,
 
     rng = np.random.default_rng(seed)
 
-    # ---- AUTO-DETECT PEAK COUNT ----
-    if auto_detect_peaks:
-        # Use find_peaks to estimate how many peaks are present
-        suggested_n = _estimate_peak_count(y_fit)
-        # Don't fit more than max_peaks (safety limit)
-        max_peaks_to_try = min(suggested_n + 1, max_peaks)
-        # But at least try 2 if only 1 was detected (sometimes find_peaks misses shoulders)
-        if max_peaks_to_try < 2 and suggested_n < 2:
-            max_peaks_to_try = 3
-        # Also try fitting one fewer and one more than suggested
-        peak_counts_to_try = set()
-        for n in range(max(1, suggested_n - 1), max_peaks_to_try + 1):
-            peak_counts_to_try.add(n)
-        # Always try fitting 1, 2, and 3 as well (covers cases where find_peaks misses)
-        for n in [1, 2, 3]:
-            if n <= max_peaks:
-                peak_counts_to_try.add(n)
-        peak_counts_to_try = sorted(peak_counts_to_try)
-    else:
-        # Use fixed number (legacy behavior)
-        peak_counts_to_try = list(range(1, max_peaks + 1))
-
-    # --- Fit candidates for each peak count ---
     candidates = {}
-    for n_peaks in peak_counts_to_try:
-        if n_peaks > max_peaks:
-            continue
+    for n_peaks in range(1, max_peaks + 1):
         best = _fit_fixed_n(
             x_fit, y_fit, n_peaks, values.min(), values.max(), bin_width, max_hist, n_restarts, rng
         )
@@ -218,21 +194,10 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_restarts=50, seed=42,
         k = 3 * n_peaks + 2
         return n_data * np.log(sse / n_data) + k * np.log(n_data)
 
-    # Prefer plausible candidates
     plausible_ns = [n for n, c in candidates.items() if c["plausible"]]
     pool = plausible_ns if plausible_ns else list(candidates.keys())
 
-    # Pick the best by BIC, but favor simpler models when BIC is similar
     best_n = min(pool, key=lambda n: bic(candidates[n]["sse"], n))
-    
-    # If there's a plausible candidate with fewer peaks that's almost as good, use it
-    for n in sorted(pool):
-        if candidates[n]["plausible"] and n < best_n:
-            bic_diff = bic(candidates[n]["sse"], n) - bic(candidates[best_n]["sse"], best_n)
-            if bic_diff < 5:  # threshold for "almost as good"
-                best_n = n
-                break
-
     chosen = candidates[best_n]
     sse, peaks, curve, bg_amp, bg_k = chosen["sse"], chosen["peaks"], chosen["curve"], chosen["bg_amp"], chosen["bg_k"]
 
@@ -257,12 +222,13 @@ def _parse_fcs(uploaded_file):
 
 def peek_channels_and_files(uploaded_files):
     channels = []
-    raw_max = 32768
+    raw_max = 32768  # default for Partec PAS
     if uploaded_files:
         try:
             meta, data = _parse_fcs(uploaded_files[0])
             data = data.dropna()
             channels = list(data.select_dtypes(include="number").columns)
+            # Try to get the instrument range from metadata
             if meta and '$P1R' in meta:
                 raw_max = int(meta['$P1R'])
             elif meta and '$PnR' in meta:
@@ -273,14 +239,13 @@ def peek_channels_and_files(uploaded_files):
     return channels, filenames, raw_max
 
 
-# ------------------------- Core batch analysis (updated) -------------------------
+# ------------------------- Core batch analysis (with scaling) -------------------------
 def analyze_fcs_batch(uploaded_files, dna_channel,
                       standard_filename,
                       standard_tolerance_percent=20.0,
-                      min_channel=0.0,
+                      min_channel=0.0, max_peaks=3,
                       n_restarts=50, max_plausible_cv=20.0,
-                      scale_to_1024=True, raw_max=32768,
-                      auto_detect_peaks=True, max_peaks=8):
+                      scale_to_1024=True, raw_max=32768):
     try:
         if not uploaded_files:
             return "No files were uploaded.", pd.DataFrame()
@@ -305,12 +270,11 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     fit_cache[filename] = fit_ploidy_peaks(
                         numeric_data[dna_channel].values,
                         min_channel=min_channel,
+                        max_peaks=max_peaks,
                         n_restarts=n_restarts,
                         max_plausible_cv=max_plausible_cv,
                         scale_to_1024=scale_to_1024,
-                        raw_max=raw_max,
-                        auto_detect_peaks=auto_detect_peaks,
-                        max_peaks=max_peaks
+                        raw_max=raw_max
                     )
             except Exception:
                 pass
@@ -335,121 +299,95 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                 numeric_data = data.select_dtypes(include="number")
 
                 # Initialize values
-                peaks_data = {}  # store all peaks
+                mean_embryo = cv_embryo = ""
+                mean_endosperm = cv_endosperm = ""
+                mean_standard = cv_standard = ""
                 embryo_standard = endosperm_standard = endosperm_embryo = ""
 
                 fit = fit_cache.get(filename)
                 if fit and fit["success"]:
-                    all_peaks = fit["peaks"]  # sorted by mu
+                    peaks = fit["peaks"]  # sorted by mu
 
                     # Identify Standard peak based on reference mean
                     std_peak = None
-                    std_peak_idx = -1
                     if standard_reference_mean is not None:
                         tol = standard_tolerance_percent / 100.0
                         best_diff = np.inf
-                        for idx, p in enumerate(all_peaks):
+                        for p in peaks:
                             diff = abs(p["mu"] - standard_reference_mean) / standard_reference_mean
                             if diff < best_diff:
                                 best_diff = diff
                                 std_peak = p
-                                std_peak_idx = idx
                         if best_diff > tol:
                             std_peak = None
-                            std_peak_idx = -1
 
-                    # Separate standard from non-standard peaks
-                    non_std_peaks = [p for i, p in enumerate(all_peaks) if i != std_peak_idx]
+                    # Separate non-standard peaks
+                    non_std_peaks = [p for p in peaks if p is not std_peak]
                     non_std_peaks.sort(key=lambda p: p["mu"])
 
-                    # ---- Assign labels to non-standard peaks ----
-                    # Label by order: Embryo, Endosperm, Embryo_G2, Endosperm_G2, Extra_...
-                    labels = ["Embryo", "Endosperm", "Embryo_G2", "Endosperm_G2"]
-                    extra_counter = 1
+                    embryo_peak = non_std_peaks[0] if len(non_std_peaks) >= 1 else None
+                    endosperm_peak = non_std_peaks[1] if len(non_std_peaks) >= 2 else None
 
-                    # Store all peaks with their labels
-                    for i, p in enumerate(non_std_peaks):
-                        if i < len(labels):
-                            label = labels[i]
-                        else:
-                            label = f"Extra_{extra_counter}"
-                            extra_counter += 1
-                        peaks_data[label] = {
-                            "mean": round(float(p["mu"]), 3),
-                            "cv": round(p["cv_percent"], 3) if p["cv_percent"] is not None else ""
-                        }
-
-                    # Add standard
+                    if embryo_peak:
+                        mean_embryo = round(float(embryo_peak["mu"]), 3)
+                        cv_embryo = round(embryo_peak["cv_percent"], 3) if embryo_peak["cv_percent"] is not None else ""
+                    if endosperm_peak:
+                        mean_endosperm = round(float(endosperm_peak["mu"]), 3)
+                        cv_endosperm = round(endosperm_peak["cv_percent"], 3) if endosperm_peak["cv_percent"] is not None else ""
                     if std_peak:
-                        peaks_data["Standard"] = {
-                            "mean": round(float(std_peak["mu"]), 3),
-                            "cv": round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
-                        }
+                        mean_standard = round(float(std_peak["mu"]), 3)
+                        cv_standard = round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
 
-                    # ---- Compute ratios ----
-                    embryo_mean = peaks_data.get("Embryo", {}).get("mean", "")
-                    endosperm_mean = peaks_data.get("Endosperm", {}).get("mean", "")
-                    standard_mean = peaks_data.get("Standard", {}).get("mean", "")
+                    # Ratios
+                    if mean_embryo != "" and mean_standard != "":
+                        embryo_standard = round(float(mean_embryo / mean_standard), 4)
+                    if mean_endosperm != "" and mean_standard != "":
+                        endosperm_standard = round(float(mean_endosperm / mean_standard), 4)
+                    if mean_embryo != "" and mean_endosperm != "":
+                        endosperm_embryo = round(float(mean_endosperm / mean_embryo), 4)
 
-                    if embryo_mean != "" and standard_mean != "":
-                        embryo_standard = round(float(embryo_mean / standard_mean), 4)
-                    if endosperm_mean != "" and standard_mean != "":
-                        endosperm_standard = round(float(endosperm_mean / standard_mean), 4)
-                    if embryo_mean != "" and endosperm_mean != "":
-                        endosperm_embryo = round(float(endosperm_mean / embryo_mean), 4)
-
-                # Build dynamic row
+                # Build row
                 row = {
                     "File": filename,
+                    "Embryo Mean": mean_embryo,
+                    "Embryo CV": cv_embryo,
+                    "Endosperm Mean": mean_endosperm,
+                    "Endosperm CV": cv_endosperm,
+                    "Standard Mean": mean_standard,
+                    "Standard CV": cv_standard,
+                    "Embryo/Standard": embryo_standard,
+                    "Endosperm/Standard": endosperm_standard,
+                    "Endosperm/Embryo": endosperm_embryo,
                     "date_FCM": today_date,
                 }
-
-                # Add all peaks found (including standard)
-                # Order: Standard, Embryo, Endosperm, Embryo_G2, Endosperm_G2, Extra_1, ...
-                peak_order = ["Standard", "Embryo", "Endosperm", "Embryo_G2", "Endosperm_G2"]
-                # Add extras
-                extra_labels = sorted([k for k in peaks_data.keys() if k.startswith("Extra_")])
-                peak_order.extend(extra_labels)
-
-                for label in peak_order:
-                    if label in peaks_data:
-                        row[f"{label} Mean"] = peaks_data[label]["mean"]
-                        row[f"{label} CV"] = peaks_data[label]["cv"]
-                    else:
-                        row[f"{label} Mean"] = ""
-                        row[f"{label} CV"] = ""
-
-                # Add ratios
-                row["Embryo/Standard"] = embryo_standard
-                row["Endosperm/Standard"] = endosperm_standard
-                row["Endosperm/Embryo"] = endosperm_embryo
-
                 batch_summary_rows.append(row)
 
-            except Exception as e:
-                # On error, still add a row with just the file name and date
+            except Exception:
                 batch_summary_rows.append({
                     "File": filename,
+                    "Embryo Mean": "",
+                    "Embryo CV": "",
+                    "Endosperm Mean": "",
+                    "Endosperm CV": "",
+                    "Standard Mean": "",
+                    "Standard CV": "",
+                    "Embryo/Standard": "",
+                    "Endosperm/Standard": "",
+                    "Endosperm/Embryo": "",
                     "date_FCM": today_date,
                 })
 
-        # Convert to DataFrame
-        df = pd.DataFrame(batch_summary_rows)
-
-        # Reorder columns: File first, date last, everything else in between
-        cols = [c for c in df.columns if c not in ["File", "date_FCM"]]
-        cols = ["File"] + sorted(cols) + ["date_FCM"]
-        df = df[cols]
+        batch_summary_df = pd.DataFrame(batch_summary_rows, columns=OUTPUT_COLUMNS)
 
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Analysis", index=False)
+            batch_summary_df.to_excel(writer, sheet_name="Analysis", index=False)
         excel_bytes = excel_buffer.getvalue()
 
-        summary_text = f"Batch processing complete. {len(df)} files processed. Detected peaks: {len(peak_order)} categories."
-        return summary_text, df, excel_bytes
+        summary_text = f"Batch processing complete. {len(batch_summary_df)} files processed."
+        return summary_text, batch_summary_df, excel_bytes
 
-    except Exception as e:
+    except Exception:
         error_trace = traceback.format_exc()
         return f"Fatal error during batch processing:\n{error_trace}", pd.DataFrame(), None
 
@@ -459,10 +397,8 @@ st.set_page_config(page_title="Flow Cytometry Analysis", layout="wide")
 st.title("Flow Cytometry Analysis")
 st.write(
     "Upload your `.fcs` files and select the internal standard file.\n\n"
-    "**Features:**\n"
-    "- Automatically detects any number of peaks (not just 3).\n"
-    "- Labels peaks as: Standard, Embryo, Endosperm, Embryo_G2, Endosperm_G2, Extra_1, ...\n"
-    "- Scales to 1024-channel scale (standard at ~100)."
+    "**Scaling:** raw instrument values are automatically mapped to a 1024-channel scale "
+    "(0–1023). The standard peak should appear around ~100 channels."
 )
 
 uploaded_files = st.file_uploader(
@@ -473,7 +409,7 @@ dna_channel = None
 standard_filename = None
 standard_tolerance_percent = 20.0
 min_channel = 0.0
-max_peaks = 8
+max_peaks = 3
 n_restarts = 50
 max_plausible_cv = 20.0
 raw_max = 32768
@@ -498,21 +434,22 @@ if uploaded_files:
             min_channel = st.number_input("Debris cutoff", min_value=0.0, value=0.0, step=10.0,
                 help="Exclude events below this channel value (on the 0-1023 scale).")
         with col5:
-            max_peaks = st.number_input("Max peaks (safety limit)", min_value=1, max_value=12, value=8, step=1,
-                help="Maximum number of peaks to detect (safety limit).")
+            max_peaks = st.number_input("Max peaks", min_value=1, max_value=5, value=3, step=1)
         with col6:
             n_restarts = st.number_input("Fit restarts", min_value=10, max_value=500, value=50, step=10)
         with col7:
-            st.number_input("Raw max (detected)", value=raw_max, disabled=True)
+            # Show detected raw max and allow override
+            st.number_input("Raw max (detected)", value=raw_max, disabled=True,
+                help="Detected from FCS metadata. You can override below.")
         
         col8, col9 = st.columns(2)
         with col8:
-            scale_checked = st.checkbox("Scale to 1024 channels", value=True)
+            scale_checked = st.checkbox("Scale to 1024 channels", value=True,
+                help="Map raw values to 0-1023 range. Uncheck to use raw instrument values.")
         with col9:
-            raw_max_override = st.number_input("Override raw max", min_value=1, value=raw_max, step=1)
+            raw_max_override = st.number_input("Override raw max", min_value=1, value=raw_max, step=1,
+                help="If auto-detection fails, set this to match your instrument's max channel (e.g., 32768 for Partec PAS).")
 
-        auto_detect = st.checkbox("Auto-detect peak count", value=True,
-            help="Automatically find the optimal number of peaks. Uncheck to use a fixed number.")
         max_plausible_cv = st.number_input("Max plausible CV%", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
 
     # Preview
@@ -528,12 +465,11 @@ if uploaded_files:
                 fit = fit_ploidy_peaks(
                     pnumeric[dna_channel].values,
                     min_channel=min_channel,
+                    max_peaks=max_peaks,
                     n_restarts=n_restarts,
                     max_plausible_cv=max_plausible_cv,
                     scale_to_1024=scale_checked,
-                    raw_max=raw_max_override,
-                    auto_detect_peaks=auto_detect,
-                    max_peaks=max_peaks
+                    raw_max=raw_max_override
                 )
                 fig, ax = plt.subplots(figsize=(8, 4))
                 if fit["hist"] is not None:
@@ -548,9 +484,9 @@ if uploaded_files:
                 if fit["success"]:
                     for i, p in enumerate(fit["peaks"]):
                         st.write(f"Peak {i+1}: mean={p['mu']:.1f}, CV={p['cv_percent']:.2f}%")
-                    st.caption(f"Detected {len(fit['peaks'])} peaks")
                 else:
                     st.warning("No peaks fitted.")
+                # Show scaled channel info
                 st.caption(f"Scaling: raw values divided by {raw_max_override} × 1023")
         except Exception as e:
             st.error(f"Preview error: {e}")
@@ -571,12 +507,9 @@ if st.button("Run Analysis", type="primary"):
                 uploaded_files, dna_channel,
                 standard_filename,
                 standard_tolerance_percent,
-                min_channel,
-                n_restarts, max_plausible_cv,
+                min_channel, max_peaks, n_restarts, max_plausible_cv,
                 scale_to_1024=scale_checked,
-                raw_max=raw_max_override,
-                auto_detect_peaks=auto_detect,
-                max_peaks=max_peaks
+                raw_max=raw_max_override
             )
         st.session_state.batch_results = (summary, df, excel)
 
