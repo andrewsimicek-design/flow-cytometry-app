@@ -26,7 +26,7 @@ OUTPUT_COLUMNS = [
     "Embryo/Standard",
     "Endosperm/Standard",
     "Endosperm/Embryo",
-    "date_FCM",   # this will be today's date
+    "date_FCM",
 ]
 
 
@@ -130,8 +130,20 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
 
 
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=50, seed=42,
-                      max_plausible_cv=20.0):
+                      max_plausible_cv=20.0, scale_to_1024=True, raw_max=32768):
+    """
+    Fit Gaussian peaks to the data. If scale_to_1024 is True, rescale raw values
+    to 0-1023 range using the provided raw_max (e.g., 32768 for Partec PAS).
+    """
     values = np.asarray(values, dtype=float)
+    
+    # ---- SCALING FIX: map raw values to 1024-channel scale ----
+    if scale_to_1024 and raw_max > 0:
+        values = values / raw_max * 1023
+        # Optionally clip to 0-1023 (but values shouldn't exceed raw_max)
+        # values = np.clip(values, 0, 1023)
+    
+    # Apply debris cutoff after scaling
     values = values[values >= min_channel]
 
     result = {"success": False, "peaks": [], "hist": None, "fit_curve": None, "note": ""}
@@ -192,7 +204,7 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, max_peaks=3, n_restarts=
     result["peaks"] = peaks
     result["fit_curve"] = (x_fit, curve)
     result["success"] = True
-    result["note"] = ""  # keep note empty to hide any algorithm messages
+    result["note"] = ""  # keep note empty
     return result
 
 
@@ -210,23 +222,30 @@ def _parse_fcs(uploaded_file):
 
 def peek_channels_and_files(uploaded_files):
     channels = []
+    raw_max = 32768  # default for Partec PAS
     if uploaded_files:
         try:
-            _, data = _parse_fcs(uploaded_files[0])
+            meta, data = _parse_fcs(uploaded_files[0])
             data = data.dropna()
             channels = list(data.select_dtypes(include="number").columns)
+            # Try to get the instrument range from metadata
+            if meta and '$P1R' in meta:
+                raw_max = int(meta['$P1R'])
+            elif meta and '$PnR' in meta:
+                raw_max = int(meta['$PnR'])
         except Exception:
-            channels = []
+            pass
     filenames = [f.name for f in uploaded_files] if uploaded_files else []
-    return channels, filenames
+    return channels, filenames, raw_max
 
 
-# ------------------------- Core batch analysis (clean output) -------------------------
+# ------------------------- Core batch analysis (with scaling) -------------------------
 def analyze_fcs_batch(uploaded_files, dna_channel,
                       standard_filename,
                       standard_tolerance_percent=20.0,
                       min_channel=0.0, max_peaks=3,
-                      n_restarts=50, max_plausible_cv=20.0):
+                      n_restarts=50, max_plausible_cv=20.0,
+                      scale_to_1024=True, raw_max=32768):
     try:
         if not uploaded_files:
             return "No files were uploaded.", pd.DataFrame()
@@ -249,8 +268,13 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                 numeric_data = data.select_dtypes(include="number")
                 if dna_channel in numeric_data.columns:
                     fit_cache[filename] = fit_ploidy_peaks(
-                        numeric_data[dna_channel].values, min_channel=min_channel,
-                        max_peaks=max_peaks, n_restarts=n_restarts, max_plausible_cv=max_plausible_cv
+                        numeric_data[dna_channel].values,
+                        min_channel=min_channel,
+                        max_peaks=max_peaks,
+                        n_restarts=n_restarts,
+                        max_plausible_cv=max_plausible_cv,
+                        scale_to_1024=scale_to_1024,
+                        raw_max=raw_max
                     )
             except Exception:
                 pass
@@ -262,7 +286,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
             if std_peaks:
                 standard_reference_mean = std_peaks[0]["mu"]
 
-        # Get today's date for the report
+        # Get today's date
         today_date = datetime.now().strftime("%Y-%m-%d")
 
         # Second pass: build summary rows
@@ -322,7 +346,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     if mean_embryo != "" and mean_endosperm != "":
                         endosperm_embryo = round(float(mean_endosperm / mean_embryo), 4)
 
-                # Build clean row with today's date
+                # Build row
                 row = {
                     "File": filename,
                     "Embryo Mean": mean_embryo,
@@ -334,12 +358,11 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Embryo/Standard": embryo_standard,
                     "Endosperm/Standard": endosperm_standard,
                     "Endosperm/Embryo": endosperm_embryo,
-                    "date_FCM": today_date,   # <-- current date for all rows
+                    "date_FCM": today_date,
                 }
                 batch_summary_rows.append(row)
 
             except Exception:
-                # On error, still add a row with empty values but today's date
                 batch_summary_rows.append({
                     "File": filename,
                     "Embryo Mean": "",
@@ -369,13 +392,13 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
         return f"Fatal error during batch processing:\n{error_trace}", pd.DataFrame(), None
 
 
-# ------------------------- Streamlit UI (minimal) -------------------------
+# ------------------------- Streamlit UI -------------------------
 st.set_page_config(page_title="Flow Cytometry Analysis", layout="wide")
 st.title("Flow Cytometry Analysis")
 st.write(
-    "Upload your `.fcs` files and select the internal standard file. "
-    "The output Excel contains only the peak means, CVs, and ratios – no extra notes. "
-    "The date column shows today's date automatically."
+    "Upload your `.fcs` files and select the internal standard file.\n\n"
+    "**Scaling:** raw instrument values are automatically mapped to a 1024-channel scale "
+    "(0–1023). The standard peak should appear around ~100 channels."
 )
 
 uploaded_files = st.file_uploader(
@@ -389,9 +412,10 @@ min_channel = 0.0
 max_peaks = 3
 n_restarts = 50
 max_plausible_cv = 20.0
+raw_max = 32768
 
 if uploaded_files:
-    channels, filenames = peek_channels_and_files(uploaded_files)
+    channels, filenames, raw_max = peek_channels_and_files(uploaded_files)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -403,19 +427,32 @@ if uploaded_files:
         standard_filename = st.selectbox("Internal Standard file", options=filenames)
 
     with st.expander("Advanced settings (optional)"):
-        col3, col4, col5, col6 = st.columns(4)
+        col3, col4, col5, col6, col7 = st.columns(5)
         with col3:
             standard_tolerance_percent = st.number_input("Standard tolerance (%)", min_value=5.0, max_value=100.0, value=20.0, step=5.0)
         with col4:
-            min_channel = st.number_input("Debris cutoff", min_value=0.0, value=0.0, step=100.0)
+            min_channel = st.number_input("Debris cutoff", min_value=0.0, value=0.0, step=10.0,
+                help="Exclude events below this channel value (on the 0-1023 scale).")
         with col5:
             max_peaks = st.number_input("Max peaks", min_value=1, max_value=5, value=3, step=1)
         with col6:
             n_restarts = st.number_input("Fit restarts", min_value=10, max_value=500, value=50, step=10)
+        with col7:
+            # Show detected raw max and allow override
+            st.number_input("Raw max (detected)", value=raw_max, disabled=True,
+                help="Detected from FCS metadata. You can override below.")
+        
+        col8, col9 = st.columns(2)
+        with col8:
+            scale_checked = st.checkbox("Scale to 1024 channels", value=True,
+                help="Map raw values to 0-1023 range. Uncheck to use raw instrument values.")
+        with col9:
+            raw_max_override = st.number_input("Override raw max", min_value=1, value=raw_max, step=1,
+                help="If auto-detection fails, set this to match your instrument's max channel (e.g., 32768 for Partec PAS).")
 
         max_plausible_cv = st.number_input("Max plausible CV%", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
 
-    # Preview (optional)
+    # Preview
     st.subheader("Preview fit")
     preview_file = st.selectbox("File to preview", options=filenames, key="preview")
     if st.button("Show Preview") and dna_channel:
@@ -426,8 +463,13 @@ if uploaded_files:
             pnumeric = pdata.select_dtypes(include="number")
             if dna_channel in pnumeric.columns:
                 fit = fit_ploidy_peaks(
-                    pnumeric[dna_channel].values, min_channel=min_channel,
-                    max_peaks=max_peaks, n_restarts=n_restarts, max_plausible_cv=max_plausible_cv
+                    pnumeric[dna_channel].values,
+                    min_channel=min_channel,
+                    max_peaks=max_peaks,
+                    n_restarts=n_restarts,
+                    max_plausible_cv=max_plausible_cv,
+                    scale_to_1024=scale_checked,
+                    raw_max=raw_max_override
                 )
                 fig, ax = plt.subplots(figsize=(8, 4))
                 if fit["hist"] is not None:
@@ -436,7 +478,7 @@ if uploaded_files:
                 if fit["fit_curve"] is not None:
                     xf, yf = fit["fit_curve"]
                     ax.plot(xf, yf, color="red", linewidth=2)
-                ax.set_xlabel(dna_channel)
+                ax.set_xlabel(f"{dna_channel} (scaled to 0-1023)")
                 ax.set_ylabel("Count")
                 st.pyplot(fig)
                 if fit["success"]:
@@ -444,6 +486,8 @@ if uploaded_files:
                         st.write(f"Peak {i+1}: mean={p['mu']:.1f}, CV={p['cv_percent']:.2f}%")
                 else:
                     st.warning("No peaks fitted.")
+                # Show scaled channel info
+                st.caption(f"Scaling: raw values divided by {raw_max_override} × 1023")
         except Exception as e:
             st.error(f"Preview error: {e}")
 
@@ -463,7 +507,9 @@ if st.button("Run Analysis", type="primary"):
                 uploaded_files, dna_channel,
                 standard_filename,
                 standard_tolerance_percent,
-                min_channel, max_peaks, n_restarts, max_plausible_cv
+                min_channel, max_peaks, n_restarts, max_plausible_cv,
+                scale_to_1024=scale_checked,
+                raw_max=raw_max_override
             )
         st.session_state.batch_results = (summary, df, excel)
 
