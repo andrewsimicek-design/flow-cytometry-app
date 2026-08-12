@@ -105,8 +105,8 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
             merged.append(p)
     return merged
 
-def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50, seed=42,
-                      max_plausible_cv=20.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
+def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=5, n_restarts=100, seed=42,
+                      max_plausible_cv=30.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
     values = np.asarray(values, dtype=float)
     if scale_to_1024 and raw_max > 0:
         values = values / raw_max * 1023
@@ -133,7 +133,7 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50
         return result
 
     rng = np.random.default_rng(seed)
-    actual_restarts = 10 if preview_mode else n_restarts
+    actual_restarts = 20 if preview_mode else n_restarts
 
     best = _fit_fixed_n(
         x_fit, y_fit, n_peaks, values.min(), values.max(),
@@ -145,6 +145,7 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50
 
     sse, peaks, curve, bg_amp, bg_k = best
     merged_peaks = _merge_close_peaks(peaks)
+    # Quality filter – only drop peaks with CV > max_plausible_cv
     merged_peaks = [p for p in merged_peaks if p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv]
 
     result["peaks"] = merged_peaks
@@ -186,9 +187,10 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                       standard_filename,
                       standard_tolerance_percent=30.0,
                       min_channel=0.0,
-                      n_peaks=3, n_restarts=50, max_plausible_cv=20.0,
+                      n_peaks=5, n_restarts=100, max_plausible_cv=30.0,
                       scale_to_1024=True, raw_max=32768,
-                      manual_standard_mean=None):
+                      manual_standard_mean=None,
+                      force_lowest_peak_as_standard=True):
     try:
         if not uploaded_files:
             return "No files uploaded.", pd.DataFrame()
@@ -229,7 +231,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
             if std_peaks:
                 standard_reference_mean = std_peaks[0]["mu"]
 
-        # If no standard reference found, use the lowest peak from the standard file
+        # If still None, use the lowest peak from standard file as fallback
         if standard_reference_mean is None and standard_filename and standard_filename in fit_cache:
             std_peaks = fit_cache[standard_filename].get("peaks", [])
             if std_peaks:
@@ -257,7 +259,11 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     std_peak = None
                     std_idx = -1
 
-                    if standard_reference_mean is not None:
+                    if force_lowest_peak_as_standard:
+                        # Always use the lowest peak as standard
+                        std_peak = all_peaks[0]
+                        std_idx = 0
+                    elif standard_reference_mean is not None:
                         tol = standard_tolerance_percent / 100.0
                         best_diff = np.inf
                         for idx, p in enumerate(all_peaks):
@@ -266,12 +272,12 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                                 best_diff = diff
                                 std_peak = p
                                 std_idx = idx
-                        # If no peak is close enough, use the LOWEST peak as standard (Hieracium fallback)
+                        # If no peak is close enough, fallback to lowest
                         if best_diff > tol:
-                            std_peak = all_peaks[0]  # lowest peak
+                            std_peak = all_peaks[0]
                             std_idx = 0
                     else:
-                        # No reference: use the LOWEST peak as standard
+                        # No reference: use the lowest peak as standard
                         std_peak = all_peaks[0]
                         std_idx = 0
 
@@ -336,9 +342,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                 batch_summary_rows.append({"File": filename, "date_FCM": today_date})
 
         df = pd.DataFrame(batch_summary_rows)
-        # Reorder columns: File first, date last
         cols = [c for c in df.columns if c not in ["File", "date_FCM"]]
-        # Sort column names alphabetically for consistency
         cols = ["File"] + sorted(cols) + ["date_FCM"]
         df = df[cols]
 
@@ -359,20 +363,21 @@ st.set_page_config(page_title="Flow Cytometry Analysis", layout="wide")
 st.title("Flow Cytometry Analysis")
 st.write(
     "Upload .fcs files and set the number of peaks to fit.\n\n"
-    "**Standard matching:** If no peak matches the standard reference, the app will fallback to using the LOWEST peak as the standard (Hieracium standard is typically leftmost)."
+    "**Important:** If a peak is skipped, increase 'Number of peaks to fit' (e.g., 4 or 5) and check the preview."
 )
 
 uploaded_files = st.file_uploader("Upload .fcs Files", type=["fcs"], accept_multiple_files=True)
 
 dna_channel = None
 standard_filename = None
-n_peaks = 3
-n_restarts = 50
+n_peaks = 5
+n_restarts = 100
 min_channel = 0.0
 standard_tolerance_percent = 30.0
-max_plausible_cv = 20.0
+max_plausible_cv = 30.0
 raw_max = 32768
 manual_standard_mean = None
+force_lowest_peak = True
 
 if uploaded_files:
     channels, filenames, raw_max = peek_channels_and_files(uploaded_files)
@@ -389,27 +394,30 @@ if uploaded_files:
     with st.expander("Advanced settings"):
         col3, col4, col5, col6 = st.columns(4)
         with col3:
-            n_peaks = st.number_input("Number of peaks to fit", min_value=1, max_value=8, value=3, step=1)
+            n_peaks = st.number_input("Number of peaks to fit", min_value=1, max_value=10, value=5, step=1,
+                help="Increase this if peaks are being skipped.")
         with col4:
-            n_restarts = st.number_input("Fit restarts", min_value=10, max_value=500, value=50, step=10)
+            n_restarts = st.number_input("Fit restarts", min_value=10, max_value=500, value=100, step=10)
         with col5:
             min_channel = st.number_input("Debris cutoff", min_value=0.0, value=0.0, step=10.0)
         with col6:
             standard_tolerance_percent = st.number_input("Standard tolerance (%)", min_value=5.0, max_value=100.0, value=30.0, step=5.0)
 
-        col7, col8, col9 = st.columns(3)
+        col7, col8, col9, col10 = st.columns(4)
         with col7:
-            max_plausible_cv = st.number_input("Max plausible CV%", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
+            max_plausible_cv = st.number_input("Max plausible CV%", min_value=1.0, max_value=100.0, value=30.0, step=1.0)
         with col8:
             scale_checked = st.checkbox("Scale to 1024", value=True)
         with col9:
             raw_max_override = st.number_input("Override raw max", min_value=1, value=raw_max, step=1)
+        with col10:
+            force_lowest_peak = st.checkbox("Force lowest peak as Standard", value=True,
+                help="Check this for Hieracium where standard is the leftmost peak.")
 
-        # Manual standard override
         manual_standard_mean = st.number_input(
             "Manual Standard Mean (optional, overrides auto-detection)",
             min_value=0.0, value=0.0, step=1.0,
-            help="Enter the expected standard peak mean (scaled) if auto-detection fails. Leave 0 for auto."
+            help="Enter expected standard mean (scaled) if auto fails. Leave 0 for auto."
         )
         if manual_standard_mean == 0:
             manual_standard_mean = None
@@ -418,7 +426,7 @@ if uploaded_files:
     st.subheader("Preview fit")
     preview_file = st.selectbox("File to preview", options=filenames, key="preview")
     if st.button("Show Preview") and dna_channel:
-        with st.spinner("Fitting..."):
+        with st.spinner("Fitting (fast mode)..."):
             pfile = next(f for f in uploaded_files if f.name == preview_file)
             try:
                 _, pdata = _parse_fcs(pfile)
@@ -446,8 +454,9 @@ if uploaded_files:
                     ax.set_ylabel("Count")
                     st.pyplot(fig)
                     if fit["success"]:
+                        st.write(f"**Detected {len(fit['peaks'])} peaks:**")
                         for i, p in enumerate(fit["peaks"]):
-                            st.write(f"Peak {i+1}: mean={p['mu']:.1f}, CV={p['cv_percent']:.2f}%")
+                            st.write(f"  Peak {i+1}: mean={p['mu']:.1f}, CV={p['cv_percent']:.2f}%")
                     else:
                         st.warning("No peaks fitted.")
                     st.caption(f"Scaling: raw / {raw_max_override} * 1023")
@@ -473,7 +482,8 @@ if st.button("Run Analysis", type="primary"):
                 n_peaks, n_restarts, max_plausible_cv,
                 scale_to_1024=scale_checked,
                 raw_max=raw_max_override,
-                manual_standard_mean=manual_standard_mean
+                manual_standard_mean=manual_standard_mean,
+                force_lowest_peak_as_standard=force_lowest_peak
             )
         st.session_state.batch_results = (summary, df, excel)
 
