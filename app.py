@@ -13,36 +13,31 @@ from scipy.optimize import curve_fit
 
 OUTPUT_XLSX_NAME = "batch_flow_cytometry_analysis.xlsx"
 
-# Updated column names as requested by supervisor
+# Column names for the output Excel (biological labels)
 TRACKING_FIELDS = [
-    "mean_peak_1",
+    "mean_peak_1",      # Embryo
     "cv_peak_1",
-    "mean_peak_2",
+    "mean_peak_2",      # Endosperm
     "cv_peak_2",
-    "mean_peak_3",
+    "mean_peak_3",      # Standard
     "cv_peak_3",
     "Embryo/Standard",
     "Endosperm/Standard",
     "Endosperm/Embryo",
     "date_FCM",
     "notes",
-    "Ploidy",          # optional extra, can be removed if not needed
+    "Ploidy",           # optional extra
 ]
 
 
-# ------------------------- Ploidy classification helper -------------------------
+# ------------------------- Ploidy classification (optional) -------------------------
 def _classify_ploidy(peaks, tolerance=0.20):
     """
-    Classify ploidy based on the FIRST (lowest) peak only.
-    Returns a single label like "2x", "3x", "4x", "6x", "8x", or "aneuploid".
-    The first peak is always considered the base (ratio = 1.0) mapped to "2x".
+    Simple classification based on the first (lowest) peak as 2x.
     """
     if not peaks:
         return "No peaks"
-
-    # Use ONLY the first (lowest) peak
     ratio = 1.0
-
     expected = {
         1.0: "2x",
         1.5: "3x",
@@ -50,7 +45,6 @@ def _classify_ploidy(peaks, tolerance=0.20):
         3.0: "6x",
         4.0: "8x",
     }
-
     best_label = None
     best_diff = float('inf')
     for exp, label in expected.items():
@@ -58,7 +52,6 @@ def _classify_ploidy(peaks, tolerance=0.20):
         if diff < best_diff:
             best_diff = diff
             best_label = label
-
     if best_diff <= tolerance:
         return best_label
     else:
@@ -270,8 +263,10 @@ def peek_channels_and_files(uploaded_files):
 
 
 # ------------------------- Core batch analysis (updated) -------------------------
-def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channel, max_peaks=3,
-                       n_restarts=50, max_plausible_cv=20.0):
+def analyze_fcs_batch(uploaded_files, dna_channel,
+                      standard_min_channel, standard_max_channel,
+                      min_channel, max_peaks=3,
+                      n_restarts=50, max_plausible_cv=20.0):
     try:
         if not uploaded_files:
             return "No files were uploaded.", pd.DataFrame(), None
@@ -287,7 +282,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
         parsed_cache = {}
         fit_cache = {}
 
-        # First pass: parse and fit all files to get standard's 2C peak
+        # First pass: parse and fit all files
         for uploaded_file in uploaded_files:
             filename = uploaded_file.name
             try:
@@ -306,14 +301,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
             except Exception:
                 pass
 
-        # Get standard's 2C peak (first peak)
-        standard_2c_mean = None
-        if standard_filename and standard_filename in fit_cache:
-            std_peaks = fit_cache[standard_filename].get("peaks", [])
-            if std_peaks:
-                standard_2c_mean = std_peaks[0]["mu"]
-
-        # Second pass: build summary rows
+        # Second pass: build summary rows with biological peak assignment
         for uploaded_file in uploaded_files:
             filename = uploaded_file.name
             try:
@@ -339,7 +327,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                             "Std Dev": None, "Explained Variance Ratio": round(float(ev), 6),
                         })
 
-                # --- per-channel stats (unchanged) ---
+                # --- per-channel stats ---
                 for channel in numeric_data.columns:
                     series = numeric_data[channel]
                     combined_stats_rows.append({
@@ -349,66 +337,78 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
                         "Explained Variance Ratio": None,
                     })
 
-                # --- Extract peaks and compute required values ---
+                # --- Extract peaks and assign biological labels ---
                 date_fcm = meta.get("$DATE", "") if isinstance(meta, dict) else ""
-
-                # Initialize all columns (will be overwritten if fit succeeds)
-                mean_peak_1 = ""
-                cv_peak_1 = ""
-                mean_peak_2 = ""
-                cv_peak_2 = ""
-                mean_peak_3 = ""
-                cv_peak_3 = ""
-                embryo_std = ""
-                endosperm_std = ""
-                endosperm_embryo = ""
                 notes = ""
                 ploidy_label = ""
 
+                # Initialize all columns as empty
+                mean_embryo = cv_embryo = ""
+                mean_endosperm = cv_endosperm = ""
+                mean_standard = cv_standard = ""
+                embryo_standard = endosperm_standard = endosperm_embryo = ""
+
                 fit = fit_cache.get(filename)
                 if fit and fit["success"]:
-                    peaks = fit["peaks"]
-                    if len(peaks) >= 1:
-                        mean_peak_1 = round(float(peaks[0]["mu"]), 3)
-                        cv_peak_1 = round(peaks[0]["cv_percent"], 3) if peaks[0]["cv_percent"] is not None else ""
-                    if len(peaks) >= 2:
-                        mean_peak_2 = round(float(peaks[1]["mu"]), 3)
-                        cv_peak_2 = round(peaks[1]["cv_percent"], 3) if peaks[1]["cv_percent"] is not None else ""
-                    if len(peaks) >= 3:
-                        mean_peak_3 = round(float(peaks[2]["mu"]), 3)
-                        cv_peak_3 = round(peaks[2]["cv_percent"], 3) if peaks[2]["cv_percent"] is not None else ""
-
-                    # --- Compute ratios ---
-                    # Embryo/Standard: peak1 / standard_2c_mean
-                    if standard_2c_mean is not None and mean_peak_1 != "":
-                        embryo_std = round(float(mean_peak_1 / standard_2c_mean), 4)
-                    # Endosperm/Standard: peak2 / standard_2c_mean
-                    if standard_2c_mean is not None and mean_peak_2 != "":
-                        endosperm_std = round(float(mean_peak_2 / standard_2c_mean), 4)
-                    # Endosperm/Embryo: peak2 / peak1
-                    if mean_peak_1 != "" and mean_peak_2 != "":
-                        endosperm_embryo = round(float(mean_peak_2 / mean_peak_1), 4)
-
-                    # Ploidy (optional)
-                    ploidy_label = _classify_ploidy(peaks)
+                    peaks = fit["peaks"]  # sorted by mu
                     notes = fit.get("note", "")
+
+                    # ---- Identify Standard peak based on channel range ----
+                    std_peak = None
+                    if standard_min_channel > 0 and standard_max_channel > standard_min_channel:
+                        for p in peaks:
+                            if standard_min_channel <= p["mu"] <= standard_max_channel:
+                                std_peak = p
+                                break
+
+                    # ---- Separate peaks: embryo (lowest), endosperm (next), standard (identified) ----
+                    # Remove standard from list if found
+                    non_std_peaks = [p for p in peaks if p is not std_peak]
+                    non_std_peaks.sort(key=lambda p: p["mu"])
+
+                    # Assign embryo = first non-standard (lowest), endosperm = second (if any)
+                    embryo_peak = non_std_peaks[0] if len(non_std_peaks) >= 1 else None
+                    endosperm_peak = non_std_peaks[1] if len(non_std_peaks) >= 2 else None
+
+                    # Fill values
+                    if embryo_peak:
+                        mean_embryo = round(float(embryo_peak["mu"]), 3)
+                        cv_embryo = round(embryo_peak["cv_percent"], 3) if embryo_peak["cv_percent"] is not None else ""
+                    if endosperm_peak:
+                        mean_endosperm = round(float(endosperm_peak["mu"]), 3)
+                        cv_endosperm = round(endosperm_peak["cv_percent"], 3) if endosperm_peak["cv_percent"] is not None else ""
+                    if std_peak:
+                        mean_standard = round(float(std_peak["mu"]), 3)
+                        cv_standard = round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
+
+                    # ---- Compute ratios ----
+                    if mean_embryo != "" and mean_standard != "":
+                        embryo_standard = round(float(mean_embryo / mean_standard), 4)
+                    if mean_endosperm != "" and mean_standard != "":
+                        endosperm_standard = round(float(mean_endosperm / mean_standard), 4)
+                    if mean_embryo != "" and mean_endosperm != "":
+                        endosperm_embryo = round(float(mean_endosperm / mean_embryo), 4)
+
+                    # Optional ploidy classification (based on first peak)
+                    ploidy_label = _classify_ploidy(peaks)
+
                 else:
                     notes = fit["note"] if fit else "DNA channel not found"
 
-                # Build the summary row with the new column names
+                # Build summary row with the new biological column names
                 summary_row = {
                     "File": filename,
                     "Total Events (post-cleaning)": int(numeric_data.shape[0]),
                     "Channels": ", ".join(numeric_data.columns.astype(str)),
                     "PCA Note": pca_note,
-                    "mean_peak_1": mean_peak_1,
-                    "cv_peak_1": cv_peak_1,
-                    "mean_peak_2": mean_peak_2,
-                    "cv_peak_2": cv_peak_2,
-                    "mean_peak_3": mean_peak_3,
-                    "cv_peak_3": cv_peak_3,
-                    "Embryo/Standard": embryo_std,
-                    "Endosperm/Standard": endosperm_std,
+                    "mean_peak_1": mean_embryo,        # Embryo
+                    "cv_peak_1": cv_embryo,
+                    "mean_peak_2": mean_endosperm,     # Endosperm
+                    "cv_peak_2": cv_endosperm,
+                    "mean_peak_3": mean_standard,      # Standard
+                    "cv_peak_3": cv_standard,
+                    "Embryo/Standard": embryo_standard,
+                    "Endosperm/Standard": endosperm_standard,
                     "Endosperm/Embryo": endosperm_embryo,
                     "date_FCM": date_fcm,
                     "notes": notes,
@@ -463,13 +463,13 @@ def analyze_fcs_batch(uploaded_files, dna_channel, standard_filename, min_channe
         return f"Fatal error during batch processing:\n{error_trace}", pd.DataFrame(), None
 
 
-# ------------------------- Streamlit UI (unchanged, but with updated help text) -------------------------
+# ------------------------- Streamlit UI (updated with standard range inputs) -------------------------
 st.set_page_config(page_title="Flow Cytometry Batch Analysis", layout="wide")
 st.title("Flow Cytometry Batch Analysis")
 st.write(
     "Upload one or more `.fcs` files. The app fits Gaussian peaks (with background subtraction) "
-    "and extracts **Mean** and **CV** for up to 3 peaks. Ratios (Embryo/Standard, Endosperm/Standard, "
-    "Endosperm/Embryo) are calculated if an internal standard file is provided."
+    "and assigns them to **Embryo**, **Endosperm**, and **Standard** based on an expected channel range for the standard. "
+    "Ratios (Embryo/Standard, Endosperm/Standard, Endosperm/Embryo) are calculated accordingly."
 )
 
 uploaded_files = st.file_uploader(
@@ -477,7 +477,8 @@ uploaded_files = st.file_uploader(
 )
 
 dna_channel = None
-standard_filename = "None"
+standard_min_channel = 0.0
+standard_max_channel = 0.0
 min_channel = 0.0
 max_peaks = 3
 n_restarts = 50
@@ -486,7 +487,7 @@ max_plausible_cv = 20.0
 if uploaded_files:
     channels, filenames = peek_channels_and_files(uploaded_files)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3 = st.columns(3)
     with col1:
         if channels:
             dna_channel = st.selectbox(
@@ -496,38 +497,51 @@ if uploaded_files:
             )
         else:
             st.warning("Could not read channel names from the first file.")
+
     with col2:
-        standard_filename = st.selectbox(
-            "Internal Standard file (optional)", options=["None"] + filenames,
+        standard_min_channel = st.number_input(
+            "Standard peak min channel",
+            min_value=0.0, value=0.0, step=100.0,
+            help="Lower bound of the expected channel range for the internal standard peak.",
         )
     with col3:
-        min_channel = st.number_input(
-            "Debris cutoff (exclude events below this channel value)",
+        standard_max_channel = st.number_input(
+            "Standard peak max channel",
             min_value=0.0, value=0.0, step=100.0,
-            help="Set this above any debris peak near the origin, based on the preview plot below.",
+            help="Upper bound of the expected channel range for the internal standard peak.",
         )
+
+    col4, col5, col6, col7 = st.columns(4)
     with col4:
+        min_channel = st.number_input(
+            "Debris cutoff (exclude below this)",
+            min_value=0.0, value=0.0, step=100.0,
+            help="Exclude events below this channel value (remove debris).",
+        )
+    with col5:
         max_peaks = st.number_input(
             "Max peaks to detect",
             min_value=1, max_value=5, value=3, step=1,
-            help="Detects up to this many peaks (e.g., embryo, endosperm, standard).",
+            help="Detects up to this many peaks.",
         )
-    with col5:
+    with col6:
         n_restarts = st.number_input(
             "Fit thoroughness (restarts)",
             min_value=10, max_value=500, value=50, step=10,
-            help="Higher = more likely to find small/off-position peaks, but slower.",
+            help="Higher = more likely to find small peaks, but slower.",
         )
+    with col7:
+        st.write("")  # spacing
 
     with st.expander("Advanced: peak quality control"):
         max_plausible_cv = st.number_input(
             "Max plausible peak CV% (reject fits above this)",
             min_value=1.0, max_value=100.0, value=20.0, step=1.0,
-            help="Rejects fits with any peak CV% above this threshold (prevents debris misfit).",
+            help="Rejects fits with any peak CV% above this threshold.",
         )
         st.caption(
-            "If 'Max peaks to detect' is set higher than the number of real populations, "
-            "the QC filter automatically discards the extra debris peak and falls back to fewer peaks."
+            "If 'Max peaks to detect' is higher than the number of real populations, "
+            "the QC filter discards extra debris peaks."
         )
 
     st.subheader("Preview: check the fit before running the full batch")
@@ -575,11 +589,14 @@ if st.button("Run Batch Analysis", type="primary"):
         st.warning("Please upload at least one .fcs file first.")
     elif not dna_channel:
         st.warning("Please select a DNA/PI fluorescence channel first.")
+    elif standard_min_channel == 0 and standard_max_channel == 0:
+        st.warning("Please set a valid channel range for the standard peak (min and max).")
     else:
-        std_name = None if standard_filename == "None" else standard_filename
         with st.spinner("Processing files..."):
             summary_text, preview_df, excel_bytes = analyze_fcs_batch(
-                uploaded_files, dna_channel, std_name, min_channel, max_peaks, n_restarts, max_plausible_cv
+                uploaded_files, dna_channel,
+                standard_min_channel, standard_max_channel,
+                min_channel, max_peaks, n_restarts, max_plausible_cv
             )
         st.session_state.batch_results = (summary_text, preview_df, excel_bytes)
 
