@@ -13,6 +13,7 @@ from scipy.optimize import curve_fit
 
 OUTPUT_XLSX_NAME = "flow_cytometry_analysis.xlsx"
 
+
 # ------------------------- Gaussian fitting core -------------------------
 def _gaussian(x, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
@@ -73,15 +74,21 @@ def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_h
 
     return best
 
-def _merge_close_peaks(peaks, min_separation_sigma=1.0):
+def _merge_close_peaks(peaks, min_separation_sigma=2.0):
+    """
+    Merge peaks that are too close together.
+    Uses 2× sigma as the threshold (more conservative).
+    """
     if len(peaks) < 2:
         return peaks
     peaks = sorted(peaks, key=lambda p: p["mu"])
     merged = [peaks[0]]
+    
     for p in peaks[1:]:
         last = merged[-1]
         avg_sigma = (last["sigma"] + p["sigma"]) / 2.0
         if avg_sigma > 0 and abs(p["mu"] - last["mu"]) < min_separation_sigma * avg_sigma:
+            # Merge the two peaks
             w1 = last["amp"] * last["sigma"]
             w2 = p["amp"] * p["sigma"]
             total_w = w1 + w2
@@ -105,7 +112,11 @@ def _merge_close_peaks(peaks, min_separation_sigma=1.0):
     return merged
 
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50, seed=42,
-                      max_plausible_cv=20.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
+                      max_plausible_cv=30.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
+    """
+    Fit Gaussian peaks with quality control.
+    Returns only peaks that pass QC (CV < 30%, amplitude > 15% of main peak).
+    """
     values = np.asarray(values, dtype=float)
     if scale_to_1024 and raw_max > 0:
         values = values / raw_max * 1023
@@ -143,7 +154,18 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50
 
     sse, peaks, curve, bg_amp, bg_k = best
     merged_peaks = _merge_close_peaks(peaks)
+    
+    # ---- QUALITY CONTROL ----
+    # 1. Filter by CV (reject peaks with CV > 30%)
     merged_peaks = [p for p in merged_peaks if p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv]
+    
+    # 2. Filter by amplitude (reject peaks smaller than 15% of the main peak)
+    if merged_peaks:
+        max_amp = max(p["amp"] for p in merged_peaks)
+        merged_peaks = [p for p in merged_peaks if p["amp"] >= 0.15 * max_amp]
+    
+    # 3. Sort by mean (ascending)
+    merged_peaks.sort(key=lambda p: p["mu"])
 
     result["peaks"] = merged_peaks
     result["fit_curve"] = (x_fit, curve)
@@ -184,7 +206,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                       standard_filename,
                       standard_tolerance_percent=30.0,
                       min_channel=0.0,
-                      n_peaks=3, n_restarts=50, max_plausible_cv=20.0,
+                      n_peaks=3, n_restarts=50, max_plausible_cv=30.0,
                       scale_to_1024=True, raw_max=32768,
                       manual_standard_mean=None,
                       force_lowest_peak_as_standard=True):
@@ -253,16 +275,17 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                 embryo_standard = endosperm_standard = endosperm_embryo = ""
 
                 if fit and fit["success"]:
-                    all_peaks = fit["peaks"]  # sorted by mu
+                    all_peaks = fit["peaks"]  # sorted by mu (now QC'd)
 
                     # ---- Identify Standard peak ----
                     std_peak = None
                     std_idx = -1
 
                     if force_lowest_peak_as_standard:
-                        std_peak = all_peaks[0]
-                        std_idx = 0
-                    elif standard_reference_mean is not None:
+                        if all_peaks:
+                            std_peak = all_peaks[0]
+                            std_idx = 0
+                    elif standard_reference_mean is not None and all_peaks:
                         tol = standard_tolerance_percent / 100.0
                         best_diff = np.inf
                         for idx, p in enumerate(all_peaks):
@@ -271,41 +294,45 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                                 best_diff = diff
                                 std_peak = p
                                 std_idx = idx
-                        if best_diff > tol:
+                        if best_diff > tol and all_peaks:
                             std_peak = all_peaks[0]
                             std_idx = 0
-                    else:
+                    elif all_peaks:
                         std_peak = all_peaks[0]
                         std_idx = 0
 
                     # Remove standard, label remaining by order
-                    non_std = [p for i, p in enumerate(all_peaks) if i != std_idx]
-                    non_std.sort(key=lambda p: p["mu"])
+                    if std_peak is not None:
+                        non_std = [p for i, p in enumerate(all_peaks) if i != std_idx]
+                        non_std.sort(key=lambda p: p["mu"])
 
-                    # ---- Assign values ----
-                    if std_peak:
-                        standard_mean = round(float(std_peak["mu"]), 3)
-                        standard_cv = round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
+                        # ---- Assign values ----
+                        # Standard
+                        if std_peak:
+                            standard_mean = round(float(std_peak["mu"]), 3)
+                            standard_cv = round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
 
-                    if len(non_std) >= 1:
-                        embryo_mean = round(float(non_std[0]["mu"]), 3)
-                        embryo_cv = round(non_std[0]["cv_percent"], 3) if non_std[0]["cv_percent"] is not None else ""
+                        # Embryo = first non-standard (if it passes QC)
+                        if len(non_std) >= 1:
+                            embryo_mean = round(float(non_std[0]["mu"]), 3)
+                            embryo_cv = round(non_std[0]["cv_percent"], 3) if non_std[0]["cv_percent"] is not None else ""
 
-                    if len(non_std) >= 2:
-                        endosperm_mean = round(float(non_std[1]["mu"]), 3)
-                        endosperm_cv = round(non_std[1]["cv_percent"], 3) if non_std[1]["cv_percent"] is not None else ""
+                        # Endosperm = second non-standard (if it passes QC)
+                        if len(non_std) >= 2:
+                            endosperm_mean = round(float(non_std[1]["mu"]), 3)
+                            endosperm_cv = round(non_std[1]["cv_percent"], 3) if non_std[1]["cv_percent"] is not None else ""
 
-                    # ---- Ratios ----
-                    if embryo_mean != "" and standard_mean != "":
-                        embryo_standard = round(float(embryo_mean / standard_mean), 4)
-                    if endosperm_mean != "" and standard_mean != "":
-                        endosperm_standard = round(float(endosperm_mean / standard_mean), 4)
-                    if embryo_mean != "" and endosperm_mean != "":
-                        endosperm_embryo = round(float(endosperm_mean / embryo_mean), 4)
+                        # ---- Ratios ----
+                        if embryo_mean != "" and standard_mean != "":
+                            embryo_standard = round(float(embryo_mean / standard_mean), 4)
+                        if endosperm_mean != "" and standard_mean != "":
+                            endosperm_standard = round(float(endosperm_mean / standard_mean), 4)
+                        if embryo_mean != "" and endosperm_mean != "":
+                            endosperm_embryo = round(float(endosperm_mean / embryo_mean), 4)
 
                 # ---- Build row in docent's format ----
                 row = {
-                    "Sample_ID": "",
+                    "Sample_ID": filename.replace(".fcs", ""),
                     "File_name": filename,
                     "Mean_1peak_[standard]": standard_mean,
                     "Mean_2peak_[embryo]": embryo_mean,
@@ -323,7 +350,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
 
             except Exception as e:
                 batch_summary_rows.append({
-                    "Sample_ID": "",
+                    "Sample_ID": filename.replace(".fcs", ""),
                     "File_name": filename,
                     "Mean_1peak_[standard]": "",
                     "Mean_2peak_[embryo]": "",
@@ -382,7 +409,7 @@ n_peaks = 3
 n_restarts = 50
 min_channel = 0.0
 standard_tolerance_percent = 30.0
-max_plausible_cv = 20.0
+max_plausible_cv = 30.0
 raw_max = 32768
 manual_standard_mean = None
 force_lowest_peak = True
@@ -412,7 +439,7 @@ if uploaded_files:
 
         col7, col8, col9, col10 = st.columns(4)
         with col7:
-            max_plausible_cv = st.number_input("Max plausible CV%", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
+            max_plausible_cv = st.number_input("Max plausible CV%", min_value=5.0, max_value=50.0, value=30.0, step=1.0)
         with col8:
             scale_checked = st.checkbox("Scale to 1024", value=True)
         with col9:
