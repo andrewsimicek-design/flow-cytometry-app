@@ -74,9 +74,9 @@ def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_h
 
     return best
 
-def _merge_close_peaks(peaks, min_separation_sigma=3.0):  # increased from 2.0 to 3.0
+def _merge_close_peaks(peaks, min_separation_sigma=3.0):
     """
-    Merge peaks that are too close together.
+    Merge peaks that are too close together (3× sigma threshold).
     """
     if len(peaks) < 2:
         return peaks
@@ -148,7 +148,7 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50
         return result
 
     sse, peaks, curve, bg_amp, bg_k = best
-    merged_peaks = _merge_close_peaks(peaks, min_separation_sigma=3.0)  # aggressive merging
+    merged_peaks = _merge_close_peaks(peaks, min_separation_sigma=3.0)
     
     # ---- QUALITY CONTROL ----
     # 1. Filter by CV
@@ -268,9 +268,10 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                 embryo_mean = embryo_cv = ""
                 endosperm_mean = endosperm_cv = ""
                 embryo_standard = endosperm_standard = endosperm_embryo = ""
+                notes = ""
 
                 if fit and fit["success"]:
-                    all_peaks = fit["peaks"]  # sorted by mu (now QC'd)
+                    all_peaks = fit["peaks"]  # sorted by mu (QC'd)
 
                     # ---- Identify Standard peak ----
                     std_peak = None
@@ -321,11 +322,22 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                                 embryo_mean = ""
                                 embryo_cv = ""
                                 embryo_standard = ""
-                                # also clear endosperm if any (shouldn't be)
                                 endosperm_mean = ""
                                 endosperm_cv = ""
                                 endosperm_standard = ""
                                 endosperm_embryo = ""
+
+                        # ---- Notes ----
+                        if embryo_mean == "" and endosperm_mean == "":
+                            notes = "len standard"
+                        elif embryo_mean != "" and endosperm_mean == "":
+                            notes = "standard + embryo"
+                        elif embryo_mean != "" and endosperm_mean != "":
+                            notes = "standard + embryo + endosperm"
+
+                        # Check if there were small bumps (if fit detected more peaks but QC filtered them)
+                        if len(all_peaks) > len([p for p in all_peaks if p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv]):
+                            notes += " (minor bumps filtered as noise)"
 
                         # ---- Ratios ----
                         if embryo_mean != "" and standard_mean != "":
@@ -350,6 +362,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Endosperm:embryo_ratio_[Mean_3peak:Mean_2peak]": endosperm_embryo,
                     "": "",
                     "Date_of_analyses": today_date,
+                    "Poznámka": notes,
                 }
                 batch_summary_rows.append(row)
 
@@ -368,9 +381,10 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Endosperm:embryo_ratio_[Mean_3peak:Mean_2peak]": "",
                     "": "",
                     "Date_of_analyses": today_date,
+                    "Poznámka": "error",
                 })
 
-        # Create DataFrame
+        # Create DataFrame with docent's columns + Poznámka
         docent_columns = [
             "Sample_ID",
             "File_name",
@@ -384,7 +398,8 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
             "Endosperm:standard_ratio_[Mean_3peak:Mean_1peak]",
             "Endosperm:embryo_ratio_[Mean_3peak:Mean_2peak]",
             "",
-            "Date_of_analyses"
+            "Date_of_analyses",
+            "Poznámka"
         ]
 
         df = pd.DataFrame(batch_summary_rows, columns=docent_columns)
