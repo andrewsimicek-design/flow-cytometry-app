@@ -74,10 +74,9 @@ def _fit_fixed_n(x_fit, y_fit, n_peaks, values_min, values_max, bin_width, max_h
 
     return best
 
-def _merge_close_peaks(peaks, min_separation_sigma=2.0):
+def _merge_close_peaks(peaks, min_separation_sigma=3.0):  # increased from 2.0 to 3.0
     """
     Merge peaks that are too close together.
-    Uses 2× sigma as the threshold (more conservative).
     """
     if len(peaks) < 2:
         return peaks
@@ -113,10 +112,6 @@ def _merge_close_peaks(peaks, min_separation_sigma=2.0):
 
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50, seed=42,
                       max_plausible_cv=30.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
-    """
-    Fit Gaussian peaks with quality control.
-    Returns only peaks that pass QC (CV < 30%, amplitude > 15% of main peak).
-    """
     values = np.asarray(values, dtype=float)
     if scale_to_1024 and raw_max > 0:
         values = values / raw_max * 1023
@@ -153,18 +148,18 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=3, n_restarts=50
         return result
 
     sse, peaks, curve, bg_amp, bg_k = best
-    merged_peaks = _merge_close_peaks(peaks)
+    merged_peaks = _merge_close_peaks(peaks, min_separation_sigma=3.0)  # aggressive merging
     
     # ---- QUALITY CONTROL ----
-    # 1. Filter by CV (reject peaks with CV > 30%)
+    # 1. Filter by CV
     merged_peaks = [p for p in merged_peaks if p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv]
     
-    # 2. Filter by amplitude (reject peaks smaller than 15% of the main peak)
+    # 2. Filter by amplitude (keep peaks > 15% of main peak)
     if merged_peaks:
         max_amp = max(p["amp"] for p in merged_peaks)
         merged_peaks = [p for p in merged_peaks if p["amp"] >= 0.15 * max_amp]
     
-    # 3. Sort by mean (ascending)
+    # 3. Sort by mean
     merged_peaks.sort(key=lambda p: p["mu"])
 
     result["peaks"] = merged_peaks
@@ -307,20 +302,30 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                         non_std.sort(key=lambda p: p["mu"])
 
                         # ---- Assign values ----
-                        # Standard
                         if std_peak:
                             standard_mean = round(float(std_peak["mu"]), 3)
                             standard_cv = round(std_peak["cv_percent"], 3) if std_peak["cv_percent"] is not None else ""
 
-                        # Embryo = first non-standard (if it passes QC)
                         if len(non_std) >= 1:
                             embryo_mean = round(float(non_std[0]["mu"]), 3)
                             embryo_cv = round(non_std[0]["cv_percent"], 3) if non_std[0]["cv_percent"] is not None else ""
 
-                        # Endosperm = second non-standard (if it passes QC)
                         if len(non_std) >= 2:
                             endosperm_mean = round(float(non_std[1]["mu"]), 3)
                             endosperm_cv = round(non_std[1]["cv_percent"], 3) if non_std[1]["cv_percent"] is not None else ""
+
+                        # ---- Post-processing: if embryo is too close to standard, discard it ----
+                        if embryo_mean != "" and standard_mean != "":
+                            ratio = embryo_mean / standard_mean
+                            if ratio < 1.3:  # too close – treat as one peak (standard only)
+                                embryo_mean = ""
+                                embryo_cv = ""
+                                embryo_standard = ""
+                                # also clear endosperm if any (shouldn't be)
+                                endosperm_mean = ""
+                                endosperm_cv = ""
+                                endosperm_standard = ""
+                                endosperm_embryo = ""
 
                         # ---- Ratios ----
                         if embryo_mean != "" and standard_mean != "":
@@ -330,7 +335,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                         if embryo_mean != "" and endosperm_mean != "":
                             endosperm_embryo = round(float(endosperm_mean / embryo_mean), 4)
 
-                # ---- Build row in docent's format ----
+                # ---- Build row ----
                 row = {
                     "Sample_ID": filename.replace(".fcs", ""),
                     "File_name": filename,
@@ -365,7 +370,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                     "Date_of_analyses": today_date,
                 })
 
-        # Create DataFrame with docent's exact column order
+        # Create DataFrame
         docent_columns = [
             "Sample_ID",
             "File_name",
