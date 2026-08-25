@@ -403,14 +403,12 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
         error_trace = traceback.format_exc()
         return f"❌ Error:\n{error_trace}", pd.DataFrame(), None
 
-# ------------------------- Streamlit UI (Practical & Powerful) -------------------------
+# ------------------------- Streamlit UI -------------------------
 st.set_page_config(page_title="Flow Cytometry Analysis", layout="wide", page_icon="🧬")
 
 # Sidebar
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/000000/dna.png", width=60)
     st.title("⚙️ Settings")
-
     st.markdown("---")
     st.subheader("📁 Files")
     uploaded_files = st.file_uploader("Upload .fcs Files", type=["fcs"], accept_multiple_files=True)
@@ -549,27 +547,29 @@ with col_reset:
 
 # Show results
 if "batch_results" in st.session_state:
-    summary, df, excel = st.session_state.batch_results
-    st.success(summary)
+    results = st.session_state.batch_results
+    if results is not None and len(results) == 3:
+        summary, df, excel = results
+        st.success(summary)
 
-    st.subheader("📊 Results Preview")
-    st.dataframe(df, use_container_width=True)
+        st.subheader("📊 Results Preview")
+        st.dataframe(df, use_container_width=True)
 
-    col_dl1, col_dl2 = st.columns(2)
-    with col_dl1:
-        st.download_button(
-            label="📥 Download Excel",
-            data=excel,
-            file_name=OUTPUT_XLSX_NAME,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-    with col_dl2:
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name=OUTPUT_XLSX_NAME.replace(".xlsx", ".csv"),
-            mime="text/csv",
-            use_container_width=True
-        )
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(
+                label="📥 Download Excel",
+                data=excel,
+                file_name=OUTPUT_XLSX_NAME,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with col_dl2:
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=OUTPUT_XLSX_NAME.replace(".xlsx", ".csv"),
+                mime="text/csv",
+                use_container_width=True
+            )
