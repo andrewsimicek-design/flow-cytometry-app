@@ -105,7 +105,14 @@ def _merge_close_peaks(peaks, min_separation_sigma=2.0):
     return merged
 
 def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=8, n_restarts=100, seed=42,
-                      max_plausible_cv=15.0, min_peak_height=0.0, scale_to_1024=True, raw_max=32768, preview_mode=False):
+                      max_plausible_cv=15.0, min_peak_height=0.0, min_amplitude_ratio=5.0,
+                      scale_to_1024=True, raw_max=32768, preview_mode=False):
+    """
+    Fit peaks with smart filtering to detect only real peaks.
+    - min_amplitude_ratio: peak must be at least this % of the main peak
+    - min_peak_height: absolute minimum count
+    - max_plausible_cv: CV threshold for real peaks
+    """
     values = np.asarray(values, dtype=float)
     if scale_to_1024 and raw_max > 0:
         values = values / raw_max * 1023
@@ -142,11 +149,23 @@ def fit_ploidy_peaks(values, min_channel=0.0, bins=300, n_peaks=8, n_restarts=10
         if best is not None:
             sse, peaks, curve, bg_amp, bg_k = best
             merged_peaks = _merge_close_peaks(peaks, min_separation_sigma=2.0)
+            
+            # Smart filtering
             filtered = []
-            for p in merged_peaks:
-                if p["cv_percent"] is not None and p["cv_percent"] <= max_plausible_cv:
-                    if p["amp"] >= min_peak_height:
-                        filtered.append(p)
+            if merged_peaks:
+                max_amp = max(p["amp"] for p in merged_peaks)
+                for p in merged_peaks:
+                    # Condition 1: CV must be reasonable
+                    if p["cv_percent"] is not None and p["cv_percent"] > max_plausible_cv:
+                        continue
+                    # Condition 2: amplitude must be > min_amplitude_ratio % of main peak
+                    if p["amp"] < (min_amplitude_ratio / 100.0) * max_amp:
+                        continue
+                    # Condition 3: absolute minimum height
+                    if p["amp"] < min_peak_height:
+                        continue
+                    filtered.append(p)
+            
             candidates[n_peaks_attempt] = {
                 "sse": sse, "peaks": filtered, "curve": curve,
                 "bg_amp": bg_amp, "bg_k": bg_k,
@@ -205,7 +224,8 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                       standard_filename,
                       standard_tolerance_percent=30.0,
                       min_channel=0.0,
-                      n_peaks=8, n_restarts=100, max_plausible_cv=15.0, min_peak_height=0.0,
+                      n_peaks=8, n_restarts=100, max_plausible_cv=15.0,
+                      min_peak_height=0.0, min_amplitude_ratio=5.0,
                       scale_to_1024=True, raw_max=32768,
                       manual_standard_mean=None,
                       force_lowest_peak_as_standard=True):
@@ -239,6 +259,7 @@ def analyze_fcs_batch(uploaded_files, dna_channel,
                         n_restarts=n_restarts,
                         max_plausible_cv=max_plausible_cv,
                         min_peak_height=min_peak_height,
+                        min_amplitude_ratio=min_amplitude_ratio,
                         scale_to_1024=scale_to_1024,
                         raw_max=raw_max,
                         preview_mode=False
@@ -434,6 +455,7 @@ with st.sidebar:
     min_channel = st.number_input("Debris cutoff", min_value=0.0, value=0.0, step=10.0)
     max_plausible_cv = st.slider("Max plausible CV%", 1.0, 30.0, 15.0, 1.0, help="Reject peaks above this")
     min_peak_height = st.number_input("Min peak height (counts)", min_value=0.0, value=0.0, step=1.0, help="0 = detect everything")
+    min_amplitude_ratio = st.slider("Min amplitude ratio (% of main)", 1, 20, 5, help="Peaks smaller than this % of main peak are rejected")
     standard_tolerance_percent = st.slider("Standard tolerance %", 5, 100, 30, 5)
 
     st.markdown("---")
@@ -478,6 +500,7 @@ if st.button("📊 Show Preview"):
                         n_restarts=n_restarts,
                         max_plausible_cv=max_plausible_cv,
                         min_peak_height=min_peak_height,
+                        min_amplitude_ratio=min_amplitude_ratio,
                         scale_to_1024=scale_checked,
                         raw_max=raw_max_override,
                         preview_mode=True
@@ -506,7 +529,8 @@ if st.button("📊 Show Preview"):
                                     "Peak": i+1,
                                     "Mean": f"{p['mu']:.1f}",
                                     "CV%": f"{p['cv_percent']:.2f}",
-                                    "Height": f"{p['amp']:.1f}"
+                                    "Height": f"{p['amp']:.1f}",
+                                    "% of main": f"{(p['amp'] / max([pp['amp'] for pp in fit['peaks']]) * 100):.1f}%"
                                 })
                             st.dataframe(pd.DataFrame(peak_data), use_container_width=True)
                         else:
@@ -531,7 +555,8 @@ with col_run:
                     uploaded_files, dna_channel, standard_filename,
                     standard_tolerance_percent,
                     min_channel,
-                    max_peaks, n_restarts, max_plausible_cv, min_peak_height,
+                    max_peaks, n_restarts, max_plausible_cv,
+                    min_peak_height, min_amplitude_ratio,
                     scale_to_1024=scale_checked,
                     raw_max=raw_max_override,
                     manual_standard_mean=manual_standard_mean,
